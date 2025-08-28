@@ -1,0 +1,72 @@
+{% extends 'layout.html' %}
+
+{% block content %}
+    <h1 class="mb-4">Clients</h1>
+    <form class="row g-3 mb-3" method="get" action="/clients">
+        <div class="col-md-4">
+            <input type="text" class="form-control" name="q" placeholder="Search by name or email" value="{{ search_term }}">
+        </div>
+        <div class="col-md-3">
+            <select class="form-select" name="status">
+                <option value=""{% if not status_filter %} selected{% endif %}>All statuses</option>
+                <option value="Lead"{% if status_filter=='Lead' %} selected{% endif %}>Lead</option>
+                <option value="Active"{% if status_filter=='Active' %} selected{% endif %}>Active</option>
+                <option value="Inactive"{% if status_filter=='Inactive' %} selected{% endif %}>Inactive</option>
+            </select>
+        </div>
+        <div class="col-md-3">
+            <select class="form-select" name="sort">
+                <option value="name"{% if sort_by=='name' %} selected{% endif %}>Sort by Name</option>
+                <option value="email"{% if sort_by=='email' %} selected{% endif %}>Sort by Email</option>
+                <option value="status"{% if sort_by=='status' %} selected{% endif %}>Sort by Status</option>
+                <option value="follow_up_date"{% if sort_by=='follow_up_date' %} selected{% endif %}>Sort by Follow-up Date</option>
+            </select>
+        </div>
+        <div class="col-md-2">
+            <select class="form-select" name="order">
+                <option value="asc"{% if order=='asc' %} selected{% endif %}>Ascending</option>
+                <option value="desc"{% if order=='desc' %} selected{% endif %}>Descending</option>
+            </select>
+        </div>
+        <div class="col-md-12">
+            <button type="submit" class="btn btn-primary">Apply</button>
+            <a href="/clients/export" class="btn btn-secondary ms-2">Export CSV</a>
+        </div>
+    </form>
+
+    <div class="table-responsive">
+        <table class="table table-striped table-hover">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Phone</th>
+                    <th>Status</th>
+                    <th>Follow-up Date</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% if clients %}
+                    {% for client in clients %}
+                        <tr class="{% if client.overdue %}table-danger{% endif %}">
+                            <td>{{ client.id }}</td>
+                            <td>{{ client.name }}</td>
+                            <td>{{ client.email }}</td>
+                            <td>{{ client.phone }}</td>
+                            <td>{{ client.status }}</td>
+                            <td>{{ client.follow_up_date or '' }}</td>
+                            <td>
+                                <a href="/clients/{{ client.id }}/edit" class="btn btn-sm btn-outline-primary">Edit</a>
+                                <a href="/clients/{{ client.id }}/delete" class="btn btn-sm btn-outline-danger" onclick="return confirm('Are you sure you want to delete this client?');">Delete</a>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr><td colspan="7" class="text-center">No clients found.</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+{% endblock %}
