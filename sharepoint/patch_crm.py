@@ -3,10 +3,16 @@
    1. Real per-account rate cards (modified pricing) + a dedicated Pricing view.
    2. Live QB referral rollup replacing the stale CRM_Job_Links.Job_Value snapshot.
 Idempotent-ish: refuses to run twice (checks for a marker)."""
-import sys, io, re
+import sys, io, re, os
 
 path = sys.argv[1]
 src = io.open(path, encoding='utf-8').read()
+
+# The standard rate card is generated from the canonical rates.json data so the
+# numbers are never hand-typed into two places.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gen_standard_rates
+
 
 if 'FV_PRICING_PATCH' in src:
     sys.exit('Already patched.')
@@ -35,8 +41,9 @@ HELPERS = r"""
 // CRM → Pricing → "Standard rate card". A per-account card never depends on this.
 const RATES_API = '';
 const PRICING_TYPES = ['Standard', 'Preferred', 'Modified'];
-const RATE_UNITS = ['hour', 'day', 'week', 'month', 'each', 'sq ft', 'lin ft', 'flat', '%'];
+const RATE_UNITS = ['hour', 'day', 'week', 'month', 'each', 'gal', 'box', 'roll', 'pack', 'sq ft', 'lin ft', 'flat', '%'];
 const STD_RATES_KEY = 'fv_crm_standard_rates';
+""" + gen_standard_rates.emit_js() + r"""
 
 // A rate card is an array of { label, unit, rate, note }. It is stored on the
 // account as JSON in CRM_Accounts/Pricing_Rates_JSON.
@@ -61,21 +68,38 @@ function stringifyRates(rows) {
     return { label: r.label, unit: r.unit || 'hour', rate: parseFloat(r.rate) || 0, note: r.note || '' };
   }));
 }
+// The published card ships with the app, so deltas work on first load with no
+// setup. A locally edited card overrides it; clearing that reverts to published.
 function getStandardRates() {
-  try { return parseRates(localStorage.getItem(STD_RATES_KEY)); } catch (e) { return []; }
+  try {
+    var custom = parseRates(localStorage.getItem(STD_RATES_KEY));
+    if (custom.length) return custom;
+  } catch (e) { /* fall through to published */ }
+  return STANDARD_RATE_CARD.map(function(r) { return { label: r.label, unit: r.unit, rate: r.rate, note: '' }; });
+}
+function usingPublishedRates() {
+  try { return !parseRates(localStorage.getItem(STD_RATES_KEY)).length; } catch (e) { return true; }
 }
 function setStandardRates(rows) {
   try { localStorage.setItem(STD_RATES_KEY, stringifyRates(rows)); } catch (e) { console.warn(e); }
 }
 function rateKey(label) { return String(label || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
-function stdRateFor(label, stdRows) {
+// Equipment is published at day/week/month, so the unit is part of the identity —
+// "Air Mover" at $31/day and $150/week are different lines. Prefer an exact
+// label+unit match, fall back to label alone so a unit typo still compares.
+function stdRateFor(label, unit, stdRows) {
   var k = rateKey(label);
-  var hit = (stdRows || getStandardRates()).filter(function(r) { return rateKey(r.label) === k; })[0];
-  return hit ? (parseFloat(hit.rate) || 0) : null;
+  var rows = (stdRows || getStandardRates()).filter(function(r) { return rateKey(r.label) === k; });
+  if (!rows.length) return null;
+  if (unit) {
+    var exact = rows.filter(function(r) { return (r.unit || '') === unit; })[0];
+    if (exact) return parseFloat(exact.rate) || 0;
+  }
+  return parseFloat(rows[0].rate) || 0;
 }
 // % difference of an account rate vs the standard rate. null when not comparable.
 function rateDelta(row, stdRows) {
-  var std = stdRateFor(row.label, stdRows);
+  var std = stdRateFor(row.label, row.unit, stdRows);
   if (std === null || !std) return null;
   return ((parseFloat(row.rate) || 0) - std) / std * 100;
 }
@@ -634,7 +658,7 @@ function _rateTableHtml(rows, stdRows, opts) {
       (opts.notes === false ? '' : '<th style="text-align:left">Note</th>') +
     '</tr></thead><tbody>' +
     rows.map(function(r) {
-      var std = stdRateFor(r.label, stdRows);
+      var std = stdRateFor(r.label, r.unit, stdRows);
       var d = rateDelta(r, stdRows);
       return '<tr>' +
         '<td><strong>' + escHtml(r.label) + '</strong></td>' +
@@ -711,7 +735,10 @@ function _editPricing(spId) {
     '<label class="form-label" style="margin-top:8px">Rate lines</label>' +
     '<div id="pf_rows"></div>' +
     '<button class="btn btn-sm" style="margin-top:8px" onclick="App._addRateRow()">+ Add line</button> ' +
-    '<button class="btn btn-sm" style="margin-top:8px" onclick="App._seedFromStandard()" title="Copy the standard rate card in as a starting point">Copy standard card</button>',
+    '<span style="margin-left:8px;font-size:12px;color:var(--text-secondary)">Copy from published:</span> ' +
+    ['Labor', 'Equipment', 'Consumable', 'Admin'].map(function(c) {
+      return '<button class="btn btn-sm" style="margin-top:8px" onclick="App._seedFromStandard(\'' + c + '\')">' + c + '</button>';
+    }).join(' '),
     '<button class="btn btn-primary" onclick="App._savePricing()">Save</button>' +
     '<button class="btn" onclick="App.closeModal()">Cancel</button>');
   _renderRateRows();
@@ -761,17 +788,26 @@ function _removeRateRow(i) {
   _rateDraft.rows.splice(i, 1);
   _renderRateRows();
 }
-function _seedFromStandard() {
+// Pull in one published category at a time — the full card is 136 lines and
+// nobody negotiates all of them. De-dupes on label+unit.
+function _seedFromStandard(cat) {
   if (!_rateDraft) return;
-  var std = getStandardRates();
-  if (!std.length) { toast('No standard rate card set yet', 'warning'); return; }
+  var std = usingPublishedRates()
+    ? STANDARD_RATE_CARD.filter(function(r) { return !cat || r.cat === cat; })
+    : getStandardRates();
+  if (!std.length) { toast('Nothing to copy for ' + (cat || 'standard'), 'warning'); return; }
   var have = {};
-  _rateDraft.rows.forEach(function(r) { have[rateKey(r.label)] = true; });
+  _rateDraft.rows.forEach(function(r) { have[rateKey(r.label) + '|' + (r.unit || '')] = true; });
+  var added = 0;
   std.forEach(function(r) {
-    if (have[rateKey(r.label)]) return;
+    var k = rateKey(r.label) + '|' + (r.unit || '');
+    if (have[k]) return;
+    have[k] = true;
     _rateDraft.rows.push({ label: r.label, unit: r.unit, rate: r.rate, note: '' });
+    added++;
   });
   _renderRateRows();
+  toast(added ? 'Added ' + added + ' ' + (cat || 'standard') + ' line' + (added === 1 ? '' : 's') : 'Already present', added ? 'success' : 'info');
 }
 async function _savePricing() {
   if (!_rateDraft) return;
@@ -803,15 +839,28 @@ async function _savePricing() {
 var _stdDraft = null;
 function _editStandardRates() {
   _stdDraft = getStandardRates().map(function(r) { return { label: r.label, unit: r.unit, rate: r.rate, note: r.note }; });
+  var published = usingPublishedRates();
   openModal('Standard rate card',
     '<p style="margin-bottom:12px;color:var(--text-secondary);font-size:13px">' +
-    'These are the published T&amp;M rates every account is compared against. Stored in this browser; ' +
-    're-enter on another device, or point <code>RATES_API</code> at the published rate feed to hydrate automatically.</p>' +
-    '<div id="sf_rows"></div>' +
+    (published
+      ? 'Showing the <strong>published Fortivo rates, ' + escHtml(STANDARD_RATE_VERSION) + '</strong> (effective ' + escHtml(STANDARD_RATE_EFFECTIVE) + ') &mdash; ' +
+        'mirrored from <code>rates.json</code>, the source the T&amp;M trackers and client rate sheets are built from. ' +
+        'Editing here creates a local override for this browser only; the published card stays the default everywhere else.'
+      : '<strong>Local override in effect</strong> for this browser. Revert to ship with the published card again.') +
+    '</p>' +
+    '<div id="sf_rows" style="max-height:50vh;overflow-y:auto"></div>' +
     '<button class="btn btn-sm" style="margin-top:8px" onclick="App._addStdRow()">+ Add line</button>',
-    '<button class="btn btn-primary" onclick="App._saveStandardRates()">Save</button>' +
+    '<button class="btn btn-primary" onclick="App._saveStandardRates()">Save override</button>' +
+    (published ? '' : '<button class="btn" onclick="App._resetStandardRates()">Revert to published</button>') +
     '<button class="btn" onclick="App.closeModal()">Cancel</button>');
   _renderStdRows();
+}
+function _resetStandardRates() {
+  try { localStorage.removeItem(STD_RATES_KEY); } catch (e) { /* nothing to clear */ }
+  _stdDraft = null;
+  closeModal();
+  toast('Reverted to published rates ' + STANDARD_RATE_VERSION, 'success');
+  render();
 }
 function _renderStdRows() {
   var host = document.getElementById('sf_rows');
@@ -846,6 +895,13 @@ function _saveStandardRates() {
 // ── Pricing view: every non-standard account in one place ──
 var _pricingSearch = '';
 Views.pricing = (el) => {
+  // Create the Pricing_* columns on first visit rather than making it a chore.
+  ensurePricingFields();
+  const pricingSetupNote = _pricingFieldState === 'creating'
+    ? '<div class="card" style="padding:12px 16px;margin-bottom:12px;background:var(--surface-subtle);font-size:13px">Adding the Pricing_* columns to CRM_Accounts&hellip;</div>'
+    : (_pricingFieldState === 'failed'
+      ? '<div class="card" style="padding:12px 16px;margin-bottom:12px;background:var(--warning-50);border-color:var(--warning-500);font-size:13px"><strong>Could not add the Pricing_* columns automatically.</strong> Rate cards will not save until they exist &mdash; use &#9881; Setup SP fields, or ask a site owner to run it.</div>'
+      : '');
   const stdRows = getStandardRates();
   const all = DB.get(KEYS.accounts);
   const custom = all.filter(hasCustomPricing);
@@ -861,11 +917,12 @@ Views.pricing = (el) => {
     </div>
     <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
       <input class="form-control" style="flex:1;min-width:200px" id="pricingSearch" placeholder="Search accounts..." value="${escHtml(_pricingSearch)}" oninput="App._pricingFilter(this.value)">
-      <button class="btn" onclick="App._editStandardRates()">&#9881; Standard rate card${stdRows.length ? ' (' + stdRows.length + ')' : ''}</button>
+      <button class="btn" onclick="App._editStandardRates()">&#9881; Standard rate card (${stdRows.length}${usingPublishedRates() ? ' &middot; ' + STANDARD_RATE_VERSION : ' &middot; local'})</button>
       <button class="btn" onclick="App._exportPricingCsv()">&#11015; Export CSV</button>
       <button class="btn btn-outline btn-sm" onclick="App._setupPricingFields()" title="Add the Pricing_* columns to CRM_Accounts">&#9881; Setup SP fields</button>
     </div>
     ${stdRows.length ? '' : '<div class="card" style="padding:12px 16px;margin-bottom:12px;background:var(--surface-subtle);font-size:13px"><strong>No standard rate card set.</strong> Set it once and every account card shows its delta against it.</div>'}
+    ${pricingSetupNote}
     ${undocumented.length ? '<div class="card" style="padding:12px 16px;margin-bottom:12px;background:var(--warning-50);border-color:var(--warning-500);font-size:13px"><strong>' + undocumented.length + ' account' + (undocumented.length === 1 ? ' is' : 's are') + ' flagged non-standard with no rates stored.</strong> That flag is just a label until the numbers are entered.</div>' : ''}
     <div id="pricingList"></div>`;
   _pricingFilter(_pricingSearch);
@@ -917,7 +974,7 @@ function _exportPricingCsv() {
       return;
     }
     a.pricingRates.forEach(function(r) {
-      var std = stdRateFor(r.label, stdRows);
+      var std = stdRateFor(r.label, r.unit, stdRows);
       var d = rateDelta(r, stdRows);
       out.push([a.name, a.pricingType, r.label, r.rate, r.unit || 'hour', std === null ? '' : std,
                 d === null ? '' : d.toFixed(1), a.pricingEffectiveDate || '', a.pricingReviewDate || '', r.note || '', a.pricingNotes || '']);
@@ -971,6 +1028,88 @@ async function _runPricingSetup() {
     toast('Pricing fields ready', 'success');
   } catch (e) { log('Error: ' + e.message); toast('Setup error: ' + e.message, 'error'); }
 }
+
+// ── Auto-provisioning: do the setup instead of asking for it ──
+// Idempotent and safe to call repeatedly; the state flag keeps it to one probe
+// per page load, and SharePoint answers 409 for a column that already exists.
+var _pricingFieldState = 'unknown';   // unknown | ok | creating | failed
+const PRICING_FIELDS = [
+  ['Pricing_Rates_JSON', 3], ['Pricing_Doc_Url', 2],
+  ['Pricing_Effective_Date', 4], ['Pricing_Review_Date', 4]
+];
+async function ensurePricingFields() {
+  if (!onSP() || _pricingFieldState === 'ok' || _pricingFieldState === 'creating') return;
+  _pricingFieldState = 'creating';
+  try {
+    const r = await fetch(SP_SITE + "/_api/web/lists/getbytitle('CRM_Accounts')/fields?$select=InternalName&$top=500",
+      { credentials: 'same-origin', headers: { 'Accept': 'application/json;odata=nometadata' } });
+    if (!r.ok) throw new Error('field list: HTTP ' + r.status);
+    const data = await r.json();
+    const have = {};
+    (data.value || []).forEach(function(f) { have[f.InternalName] = true; });
+    const missing = PRICING_FIELDS.filter(function(f) { return !have[f[0]]; });
+    if (!missing.length) { _pricingFieldState = 'ok'; return; }
+    const digest = await spDigest();
+    const hdrs = { 'Accept': 'application/json;odata=verbose', 'Content-Type': 'application/json;odata=verbose', 'X-RequestDigest': digest };
+    for (const [name, kind] of missing) {
+      const body = { '__metadata': { 'type': 'SP.Field' }, 'FieldTypeKind': kind, 'Title': name, 'StaticName': name, 'InternalName': name };
+      const fr = await fetch(SP_SITE + "/_api/web/lists/getbytitle('CRM_Accounts')/fields",
+        { method: 'POST', credentials: 'same-origin', headers: hdrs, body: JSON.stringify(body) });
+      if (!fr.ok && fr.status !== 409) throw new Error(name + ': HTTP ' + fr.status);
+    }
+    _pricingFieldState = 'ok';
+    toast('Added ' + missing.length + ' pricing field' + (missing.length === 1 ? '' : 's') + ' to CRM_Accounts', 'success');
+    render();
+  } catch (e) {
+    console.warn('Pricing field provisioning failed:', e);
+    _pricingFieldState = 'failed';
+  }
+}
+
+// One-time migration: refresh Job_Value on links written before the fix, when it
+// was set once at creation (often as 0) and never updated again.
+const JOBVALUE_BACKFILL_KEY = 'fv_crm_jobvalue_backfill_v1';
+async function autoBackfillJobValues() {
+  if (!onSP()) return;
+  try { if (localStorage.getItem(JOBVALUE_BACKFILL_KEY)) return; } catch (e) { return; }
+  var qbRows = window.CRM_QB_PNL_RAW || [];
+  var jobRows = window.CRM_JOBS_RAW || [];
+  if (!qbRows.length && !jobRows.length) return;   // nothing to reconcile against yet
+  var want = {};
+  jobRows.forEach(function(jr) {
+    var jn = normJobNum(jr.Job_Number || jr.Title || '');
+    if (jn) want[jn] = Math.round(parseFloat(jr.Total_Paid) || 0);
+  });
+  qbRows.forEach(function(q) {
+    var jn = normJobNum(q.Title || q.Job_Number || q.JobNumber || '');
+    if (jn) want[jn] = Math.round(parseFloat(q.Revenue != null ? q.Revenue : q.Income) || 0);
+  });
+  var links = DB.get(KEYS.jobLinks);
+  var stale = links.filter(function(l) {
+    var jn = normJobNum(l.jobNumber || '');
+    return jn && want[jn] !== undefined && want[jn] !== (l.jobValue || 0);
+  });
+  if (!stale.length) {
+    try { localStorage.setItem(JOBVALUE_BACKFILL_KEY, 'nothing-to-do'); } catch (e) {}
+    return;
+  }
+  var done = 0;
+  for (var i = 0; i < stale.length; i++) {
+    var l = stale[i];
+    var v = want[normJobNum(l.jobNumber)];
+    try {
+      await spUpdate('CRM_Job_Links', l._spId, JOBLINK_ENTITY, { Job_Value: v });
+      DB.update(KEYS.jobLinks, l._spId, { jobValue: v });
+      done++;
+    } catch (e) { console.warn('Backfill failed for', l.jobNumber, e); }
+  }
+  // Only mark complete on a clean sweep, so a partial run retries next load.
+  if (done === stale.length) {
+    try { localStorage.setItem(JOBVALUE_BACKFILL_KEY, String(done)); } catch (e) {}
+  }
+  if (done) { toast('Refreshed ' + done + ' job value' + (done === 1 ? '' : 's') + ' from QuickBooks', 'success'); render(); }
+}
+
 """
 
 sub1(
@@ -991,7 +1130,7 @@ sub1(
 # Hydrate standard rates on boot.
 sub1(
     "parseHash();\nloadData(true).then(() => render());",
-    "parseHash();\nhydrateStandardRates();\nloadData(true).then(() => render());",
+    "parseHash();\nhydrateStandardRates();\nloadData(true).then(() => { render(); autoBackfillJobValues(); });",
     'hydrate standard rates on boot'
 )
 
@@ -1001,7 +1140,7 @@ sub1(
     "  _setupCRMDealsList, _runCRMDealsSetup,\n"
     "  // FV_PRICING_PATCH: rate cards\n"
     "  _editPricing, _savePricing, _addRateRow, _removeRateRow, _rateEdit, _seedFromStandard,\n"
-    "  _editStandardRates, _saveStandardRates, _addStdRow, _removeStdRow, _stdEdit,\n"
+    "  _editStandardRates, _saveStandardRates, _resetStandardRates, _addStdRow, _removeStdRow, _stdEdit,\n"
     "  _pricingFilter, _exportPricingCsv, _setupPricingFields, _runPricingSetup,",
     'export new functions'
 )

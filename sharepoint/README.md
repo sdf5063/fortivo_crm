@@ -10,6 +10,7 @@ in the repo root.
 | `fortivo_crm.baseline.html` | Byte-for-byte copy of production as of 2026-07-28 |
 | `fortivo_crm.html` | **Deploy this.** Baseline + the changes below |
 | `patch_crm.py` | The transformation, as reproducible source |
+| `gen_standard_rates.py` | The published rate card, transcribed from `rates.json` |
 | `tests/` | Node tests that run against `fortivo_crm.html` directly |
 
 `python3 patch_crm.py fortivo_crm.baseline.html` reproduces `fortivo_crm.html`
@@ -48,24 +49,43 @@ pointing at nothing.
 A rate card is `[{ label, unit, rate, note }]` stored as JSON. Units are
 hour / day / week / month / each / sq ft / lin ft / flat / %.
 
-### Standard rate card
+### Standard rate card — already loaded
 
-Deltas are computed against a standard card held in browser local storage — set it
-once via **Pricing → ⚙ Standard rate card**. Line items match case- and
-punctuation-insensitively (`Technician` = `technician`), and a line with no
-standard counterpart simply shows no delta rather than a wrong one.
+The app ships with the **published Fortivo rates, 2026-V1.5 (effective June
+2026)**: 136 lines covering 14 labor categories, 28 equipment items at their
+day/week/month terms, 42 consumables, and the six admin charges clients actually
+negotiate. These are transcribed from `03_Rate Sheets/T&M HTML/rates.json` — the
+same source the T&M trackers and client rate sheets are generated from — by
+`gen_standard_rates.py`, which `patch_crm.py` calls at build time so the numbers
+are never typed into two places.
 
-To hydrate it automatically instead, point the `RATES_API` constant (top of the
-pricing block) at the published rate feed the T&M trackers already read. It is
-`''` by default, and hydration failure is non-fatal.
+Matching is unit-aware, because equipment is published per term: `Air Mover` is
+$31/day, $150/week and $435/month, and a negotiated week rate compares against
+the week standard, not the day rate. Labels match case- and
+punctuation-insensitively; a line with no published counterpart shows no delta
+rather than a wrong one.
+
+**Pricing → ⚙ Standard rate card** shows what is loaded. Editing it creates a
+local override for that browser only, with a **Revert to published** button. To
+hydrate from a live feed instead, point the `RATES_API` constant at it.
+
+When rates change: re-read `rates.json`, update the tables in
+`gen_standard_rates.py`, re-run `patch_crm.py`, redeploy.
 
 ### First run
 
-1. Deploy `fortivo_crm.html`.
-2. **Pricing → ⚙ Setup SP fields** — adds the four columns. Run once; existing
-   fields are skipped.
-3. **Pricing → ⚙ Standard rate card** — enter the published T&M rates.
-4. Work the "Label only, no rates" list down to zero.
+1. Deploy `fortivo_crm.html`. That is the only manual step.
+2. The four `Pricing_*` columns are created automatically the first time the
+   Pricing view is opened on SharePoint (`ensurePricingFields`). It probes the
+   list first and only adds what is missing, so it is safe on every load. If your
+   account cannot create columns it says so and points at **⚙ Setup SP fields**
+   for someone who can.
+3. `Job_Value` on existing job links is backfilled from QuickBooks automatically
+   on first load after the upgrade (`autoBackfillJobValues`), guarded by a
+   localStorage flag so it runs once. A partial run retries next load rather than
+   marking itself done.
+4. Work the "Label only, no rates" list down to zero — the one genuinely human
+   task, since only you know what was negotiated.
 
 Nothing here is destructive: `Pricing_Type` and `Pricing_Notes` keep their current
 meaning and values, and an account with no rate card behaves exactly as before.

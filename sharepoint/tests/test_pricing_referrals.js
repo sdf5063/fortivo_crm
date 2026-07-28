@@ -93,7 +93,7 @@ globalThis.__probe = {
   parseRates, stringifyRates, pricingSummary, rateDelta, stdRateFor,
   hasCustomPricing, pricingIsUndocumented, setStandardRates, getStandardRates,
   buildReferralIndex, referralStatsFor, referralDataMissing, DB, KEYS, fmtMoney,
-  normJobNum, qbByJobNumber
+  normJobNum, qbByJobNumber, STANDARD_RATE_CARD, STANDARD_RATE_VERSION, usingPublishedRates
 };
 ` + wrapped.slice(retIdx);
 
@@ -119,14 +119,39 @@ check('parseRates coerces rate to number', card[0].rate === 85);
 check('parseRates survives garbage', P.parseRates('{not json').length === 0);
 check('parseRates handles null', P.parseRates(null).length === 0);
 
+console.log('\n== Published standard rate card (ships with the app) ==');
+check('published card is loaded', P.STANDARD_RATE_CARD.length === 136, P.STANDARD_RATE_CARD.length);
+check('version is 2026-V1.5', P.STANDARD_RATE_VERSION === '2026-V1.5', P.STANDARD_RATE_VERSION);
+check('published is the default with no override', P.usingPublishedRates() === true);
+check('getStandardRates falls back to published', P.getStandardRates().length === 136);
+// Spot-check against rates.json 2026-V1.5.
+check('Project Manager = $120/hour', P.stdRateFor('Project Manager', 'hour') === 120, P.stdRateFor('Project Manager', 'hour'));
+check('General Laborer = $45.50/hour', P.stdRateFor('General Laborer', 'hour') === 45.5);
+check('Senior PM / Ops Manager = $139/hour', P.stdRateFor('Senior PM / Ops Manager', 'hour') === 139);
+check('Tyvek Suits = $12.45 each', P.stdRateFor('Tyvek Suits', 'each') === 12.45);
+check('Small Tools = 3%', P.stdRateFor('Small Tools', '%') === 3);
+// Equipment is published per day/week/month — the unit is part of the identity.
+check('Air Mover day = $31', P.stdRateFor('Air Mover', 'day') === 31);
+check('Air Mover week = $150', P.stdRateFor('Air Mover', 'week') === 150);
+check('Air Mover month = $435', P.stdRateFor('Air Mover', 'month') === 435);
+check('unknown unit falls back to first match', P.stdRateFor('Air Mover', 'fortnight') === 31);
+check('unknown label still returns null', P.stdRateFor('Unobtanium', 'hour') === null);
+// A discounted equipment line must compare against its own unit, not day-rate.
+const discountedWeek = { label: 'Air Mover', unit: 'week', rate: 135 };
+check('week-rate delta uses the week standard', Math.abs(P.rateDelta(discountedWeek) + 10) < 1e-9, P.rateDelta(discountedWeek));
+const laborCut = { label: 'Restoration Technician', unit: 'hour', rate: 49.05 };
+check('labor delta vs published 54.50 = -10%', Math.abs(P.rateDelta(laborCut) + 10) < 1e-9, P.rateDelta(laborCut));
+
+console.log('\n== Local override ==');
 P.setStandardRates([
   { label: 'Technician', unit: 'hour', rate: 100 },
   { label: 'Supervisor', unit: 'hour', rate: 110 },
   { label: 'Dehumidifier', unit: 'day', rate: 45 }
 ]);
 check('standard card round-trips', P.getStandardRates().length === 3);
-check('stdRateFor matches case/punctuation-insensitively', P.stdRateFor('technician') === 100);
-check('stdRateFor returns null when absent', P.stdRateFor('Air Mover') === null);
+check('override replaces the published card', P.usingPublishedRates() === false);
+check('stdRateFor matches case/punctuation-insensitively', P.stdRateFor('technician', 'hour') === 100);
+check('override hides published lines', P.stdRateFor('Air Mover', 'day') === null);
 
 const d0 = P.rateDelta(card[0]);           // 85 vs 100
 check('rateDelta -15% for discounted tech', Math.abs(d0 + 15) < 1e-9, d0);
