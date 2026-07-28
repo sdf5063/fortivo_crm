@@ -964,12 +964,38 @@ async function hydrateStandardRates() {
   } catch (e) { console.warn('Standard rate hydration skipped:', e.message); }
 }
 
+// QB customer and job labels carry descriptive suffixes — "26-02-00048 (Robin
+// Hyer--HFHS)", "26-05-00039 650 Mass Ave Report". An exact-match join on job number
+// misses those, and the miss looks exactly like "no revenue". Normalize both sides.
+const JOB_NUM_RE = /\d{2}-\d{2}-\d{5}/;
+function normJobNum(v) {
+  var s = String(v == null ? '' : v);
+  var m = s.match(JOB_NUM_RE);
+  return m ? m[0] : s.trim();
+}
+// QB_JobPnL re-keyed by bare job number.
+function qbByJobNumber() {
+  var out = {};
+  var raw = window.CRM_QB_PNL_RAW || [];
+  if (raw.length) {
+    raw.forEach(function(r) {
+      var k = normJobNum(r.Title || r.Job_Number || r.JobNumber || '');
+      if (k) out[k] = r;
+    });
+    return out;
+  }
+  var m = window.CRM_QB_PNL || {};
+  Object.keys(m).forEach(function(k) { out[normJobNum(k)] = m[k]; });
+  return out;
+}
+
 // ── Referrals: one live index, built from Jobs_Master + QB_JobPnL ──
 // Replaces the stale CRM_Job_Links.Job_Value snapshot, which was written once at
 // link-creation time (and hardcoded to 0 by the revenue sync), so referral totals
 // read $0 no matter what QuickBooks said.
 function buildReferralIndex() {
   var idx = { byId: {}, byName: {}, jobCount: 0 };
+  var qbIndex = qbByJobNumber();
   function bucket(map, key, displayName) {
     if (!map[key]) map[key] = { displayName: displayName || key, jobs: 0, invoiced: 0, collected: 0, qbRevenue: 0, lastDate: '', jobList: [] };
     return map[key];
@@ -979,8 +1005,8 @@ function buildReferralIndex() {
     var name = (j.Referred_By || '').trim();
     if (!accId && !name) return;
     idx.jobCount++;
-    var jobNum = j.Job_Number || j.Title || '';
-    var qb = (window.CRM_QB_PNL || {})[jobNum] || {};
+    var jobNum = normJobNum(j.Job_Number || j.Title || '');
+    var qb = qbIndex[jobNum] || {};
     var qbRevenue = parseFloat(qb.Revenue != null ? qb.Revenue : qb.Income) || 0;
     var invoiced = parseFloat(j.Amount) || 0;
     var collected = parseFloat(j.Total_Paid) || 0;
@@ -3879,7 +3905,7 @@ async function _autoLinkJobs(spId) {
     var linkData = {
       Title: j.Job_Number || j.Title,
       Account_Id: spId, Account_Name: a.name, Account_Role: 'Client',
-      Job_Value: Math.round(parseFloat(((window.CRM_QB_PNL || {})[j.Job_Number || j.Title] || {}).Revenue || ((window.CRM_QB_PNL || {})[j.Job_Number || j.Title] || {}).Income || 0)), Job_Status: j.Job_Status || 'Open',
+      Job_Value: (function() { var q = qbByJobNumber()[normJobNum(j.Job_Number || j.Title)] || {}; return Math.round(parseFloat(q.Revenue != null ? q.Revenue : q.Income) || 0); })(), Job_Status: j.Job_Status || 'Open',
       Link_Date: new Date().toISOString()
     };
     if (onSP()) {
@@ -3982,19 +4008,19 @@ async function _syncQBRevenue() {
     // written once (often as 0) and never refreshed, so referral totals read $0.
     var qbByJob = {};
     qbRows.forEach(function(q) {
-      var jn = q.Title || q.Job_Number || q.JobNumber || '';
+      var jn = normJobNum(q.Title || q.Job_Number || q.JobNumber || '');
       if (jn) qbByJob[jn] = Math.round(parseFloat(q.Revenue != null ? q.Revenue : q.Income) || 0);
     });
     var jmByJob = {};
     jobRows.forEach(function(jr) {
-      var jn = jr.Job_Number || jr.Title || '';
+      var jn = normJobNum(jr.Job_Number || jr.Title || '');
       if (jn) jmByJob[jn] = Math.round(parseFloat(jr.Total_Paid) || 0);
     });
     var backfilled = 0;
     var allLinks = DB.get(KEYS.jobLinks);
     for (var L = 0; L < allLinks.length; L++) {
       var link = allLinks[L];
-      var jn2 = link.jobNumber || '';
+      var jn2 = normJobNum(link.jobNumber || '');
       if (!jn2) continue;
       var want = qbByJob[jn2];
       if (want === undefined) want = jmByJob[jn2];

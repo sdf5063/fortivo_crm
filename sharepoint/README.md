@@ -105,17 +105,20 @@ The account Overview, meanwhile, matched jobs by `Referred_By_Account_Id` **or**
 - If `Jobs_Master` fails to load, the view says so and falls back to the stored
   link values, rather than displaying `$0` as though it were a fact.
 
-### Known data issue this surfaces (fix in QuickBooks, not in code)
+### Related hardening: the QB job-number join
 
-Hassle Free Home Services referrals are split across two QB hierarchies:
+QuickBooks labels its job sub-customers inconsistently — `26-01-00026` bare,
+`26-02-00048 (Robin Hyer--HFHS)` parenthesised, `26-05-00039 650 Mass Ave Report`
+with no parentheses at all. `QB_JobPnL` was joined to `Jobs_Master` by exact match
+on that label, so a decorated name found nothing, and a missed join looks exactly
+like "no revenue" on screen. Both sides are now normalized to the bare
+`NN-NN-NNNNN` first, in the referral index, the `Job_Value` backfill and
+`_autoLinkJobs`.
 
-- `Hassle Free Home Services (Northeast)` → `Carole Krooth` → `26-01-00026`
-- `Hyer, Robin` → `26-02-00048 (Robin Hyer--HFHS)` — **top level, not under HFHS**
-
-QB's own Sales by Customer report therefore credits HFHS with $3,172.55 while the
-second job sits somewhere else entirely. The CRM now totals both correctly because
-it attributes from `Referred_By` on the job, not from QB's customer tree — but the
-two systems will keep disagreeing until the QB parenting is fixed. See
+Worth knowing: referral credit comes from `Referred_By` / `Referred_By_Account_Id`
+on `Jobs_Master`, which is maintained independently of QuickBooks' customer tree.
+The CRM and QB can drift apart without either complaining. Keep `Referred_By`
+populated at job creation — it is what the rollup reads. See
 `docs/qb-crm-streamlining.md`.
 
 ---

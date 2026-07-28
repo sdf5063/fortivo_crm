@@ -92,7 +92,8 @@ const probed = wrapped.slice(0, retIdx) + `
 globalThis.__probe = {
   parseRates, stringifyRates, pricingSummary, rateDelta, stdRateFor,
   hasCustomPricing, pricingIsUndocumented, setStandardRates, getStandardRates,
-  buildReferralIndex, referralStatsFor, referralDataMissing, DB, KEYS, fmtMoney
+  buildReferralIndex, referralStatsFor, referralDataMissing, DB, KEYS, fmtMoney,
+  normJobNum, qbByJobNumber
 };
 ` + wrapped.slice(retIdx);
 
@@ -197,6 +198,32 @@ const regression = P.referralStatsFor(hfhs, idx);
 check('REGRESSION: stale Job_Value=0 no longer zeroes the total',
       regression.collected > 0, regression.collected);
 
+console.log('\n== QB job-number join normalization ==');
+// QB labels its job customers inconsistently: bare, parenthesised, or suffixed.
+check('normJobNum strips a parenthesised suffix', P.normJobNum('26-02-00048 (Robin Hyer--HFHS)') === '26-02-00048');
+check('normJobNum strips a trailing description', P.normJobNum('26-05-00039 650 Mass Ave Report') === '26-05-00039');
+check('normJobNum passes a bare number through', P.normJobNum('26-01-00026') === '26-01-00026');
+check('normJobNum leaves non-job text alone', P.normJobNum('Extra Clean, Inc.') === 'Extra Clean, Inc.');
+check('normJobNum tolerates null', P.normJobNum(null) === '');
+
+// The decisive case: Jobs_Master holds the bare number, QB holds the decorated one.
+sandbox.window.CRM_JOBS = [
+  { Job_Number: '26-05-00039', Client_Name: 'CBRE', Referred_By_Account_Id: 55,
+    Referred_By: 'CBRE', Amount: 300, Total_Paid: 300, Job_Status: 'Closed',
+    Date_Received: '2026-05-02T00:00:00Z' }
+];
+sandbox.window.CRM_QB_PNL_RAW = [{ Title: '26-05-00039 650 Mass Ave Report', Revenue: 300 }];
+sandbox.window.CRM_QB_PNL = { '26-05-00039 650 Mass Ave Report': { Revenue: 300 } };
+const decorated = P.referralStatsFor({ _spId: 55, name: 'CBRE' }, P.buildReferralIndex());
+check('decorated QB label still joins to QB revenue', decorated.qbRevenue === 300, decorated.qbRevenue);
+check('decorated QB label still counts the job', decorated.jobs === 1, decorated);
+sandbox.window.CRM_QB_PNL_RAW = [];
+
+sandbox.window.CRM_JOBS = [
+  { Job_Number: '26-01-00026', Client_Name: 'Carole Krooth', Referred_By_Account_Id: 42,
+    Referred_By: 'Hassle Free Home Services', Amount: 3500, Total_Paid: 3172.55,
+    Job_Status: 'Closed', Date_Received: '2026-01-14T00:00:00Z' }
+];
 check('referralDataMissing false when jobs loaded', P.referralDataMissing() === false);
 sandbox.window.CRM_JOBS = [];
 check('referralDataMissing true when Jobs_Master empty', P.referralDataMissing() === true);
