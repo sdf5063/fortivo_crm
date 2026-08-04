@@ -17,7 +17,7 @@ in the repo root.
 exactly, so the diff is auditable rather than a 293 KB blob.
 
 ```bash
-node tests/test_pricing_referrals.js   # 32 assertions — helpers and rollup math
+node tests/test_pricing_referrals.js   # 56 assertions — helpers, rates, rollup math
 node tests/test_views.js               # 15 assertions — rendered view output
 ```
 
