@@ -6,6 +6,12 @@ Idempotent-ish: refuses to run twice (checks for a marker)."""
 import sys, io, re, os
 
 path = sys.argv[1]
+# Writing back over the input destroys the pristine baseline, which is the only
+# record of pre-patch production. Refuse, and require an explicit output path.
+out = sys.argv[2] if len(sys.argv) > 2 else path
+if out == path and 'baseline' in os.path.basename(path).lower():
+    sys.exit('Refusing to overwrite %s in place — it is the pristine baseline.\n'
+             'Usage: python3 patch_crm.py <baseline.html> <output.html>' % path)
 src = io.open(path, encoding='utf-8').read()
 
 # The standard rate card is generated from the canonical rates.json data so the
@@ -1074,7 +1080,10 @@ async function autoBackfillJobValues() {
   try { if (localStorage.getItem(JOBVALUE_BACKFILL_KEY)) return; } catch (e) { return; }
   var qbRows = window.CRM_QB_PNL_RAW || [];
   var jobRows = window.CRM_JOBS_RAW || [];
-  if (!qbRows.length && !jobRows.length) return;   // nothing to reconcile against yet
+  // Both sources must have loaded. Either one silently degrading to [] (they use
+  // .catch(() => [])) would make `want` a partial picture, and writing that back
+  // over Job_Value would overwrite good data with a worse guess.
+  if (!qbRows.length || !jobRows.length) return;
   var want = {};
   jobRows.forEach(function(jr) {
     var jn = normJobNum(jr.Job_Number || jr.Title || '');
@@ -1110,6 +1119,294 @@ async function autoBackfillJobValues() {
   if (done) { toast('Refreshed ' + done + ' job value' + (done === 1 ? '' : 's') + ' from QuickBooks', 'success'); render(); }
 }
 
+// ══════════════════════════════════════════════
+//  FV_AR_PANEL — read-only A/R on the account view
+// ══════════════════════════════════════════════
+// Reads QB_AR_Aging (written from QuickBooks by fv_qb.py) and attributes rows to
+// accounts. WRITES NOTHING. Every failure mode renders a stated reason instead of
+// a number, because a confident wrong balance is worse than a blank.
+
+const AR_LIST = 'QB_AR_Aging';
+const AR_TOP = 5000;                 // match every other read in the app
+const AR_REWRITE_SPREAD_MIN = 5;     // fv_qb.py clear-then-reinserts every row; a
+                                     // wide Modified spread means a partial write
+// Three-state, deliberately never defaulted to []:
+//   undefined = never fetched | null = fetch failed | array = loaded
+window.CRM_AR = undefined;
+var _arLoading = false;
+
+// Dedicated fetch. A service worker is registered with a scope covering /_api/,
+// so the shared spGet could be served from Cache Storage — money must not come
+// from a cache. Not folded into spGet, which has other callers.
+async function spGetNoStore(list, query) {
+  const url = SP_SITE + "/_api/web/lists/getbytitle('" + list + "')/items?" + (query || '');
+  const r = await fetch(url, {
+    credentials: 'same-origin', cache: 'no-store',
+    headers: { 'Accept': 'application/json;odata=nometadata', 'Cache-Control': 'no-cache' }
+  });
+  if (!r.ok) throw new Error(list + ': HTTP ' + r.status);
+  const d = await r.json();
+  return d.value || [];
+}
+
+// Lazy: deliberately NOT added to loadData's Promise.all. Four of those reads have
+// no .catch, so widening that batch raises the odds of aborting the whole load —
+// which in turn feeds the Job_Value backfill a partial picture.
+async function loadAR(force) {
+  if (_arLoading) return;
+  if (!force && window.CRM_AR !== undefined) return;
+  if (!onSP()) { window.CRM_AR = null; return; }
+  _arLoading = true;
+  try {
+    window.CRM_AR = await spGetNoStore(AR_LIST, '$top=' + AR_TOP);
+  } catch (e) {
+    console.warn('A/R load failed:', e);
+    window.CRM_AR = null;      // never leave a previous run's array in place
+  } finally {
+    _arLoading = false;
+  }
+}
+
+// Anchored. normJobNum finds a job number anywhere, so "2026-01-000210" would
+// yield "26-01-00021". Money attribution needs a real standalone match.
+const STRICT_JOB_RE = /(^|[^\d])(\d{2}-\d{2}-\d{5})([^\d]|$)/;
+function strictJobNum(v) {
+  var m = String(v == null ? '' : v).match(STRICT_JOB_RE);
+  return m ? m[2] : '';
+}
+
+// Why the panel cannot show a number, in priority order. '' means it can.
+function arBlockReason() {
+  if (_arLoading) return 'loading';
+  if (window.CRM_AR === undefined) return 'unfetched';
+  if (window.CRM_AR === null) return 'unavailable';
+  var rows = window.CRM_AR;
+  if (rows.length >= AR_TOP) return 'truncated';   // spGet ignores odata.nextLink
+  if (!rows.length) return 'empty';
+  var ts = rows.map(function(r) { return Date.parse(r.Modified); }).filter(function(n) { return !isNaN(n); });
+  if (ts.length > 1) {
+    var spread = (Math.max.apply(null, ts) - Math.min.apply(null, ts)) / 60000;
+    if (spread > AR_REWRITE_SPREAD_MIN) return 'rewriting';
+  }
+  // Ownership depends on Jobs_Master. Without it we cannot say whose invoice this
+  // is, and a smaller balance would read as a real paydown.
+  if (!(window.CRM_JOBS && window.CRM_JOBS.length)) return 'nojobs';
+  return '';
+}
+
+// Job numbers claimed by more than one account. CRM_Job_Links has no uniqueness
+// constraint, and _syncQBRevenue dedupes on the raw label rather than the
+// normalized one, so duplicates under different accounts genuinely occur.
+function arContestedKeys() {
+  var owner = {}, contested = {};
+  DB.get(KEYS.jobLinks).forEach(function(l) {
+    if (!l.accountId) return;
+    var k = strictJobNum(l.jobNumber);
+    if (!k) return;
+    if (owner[k] === undefined) owner[k] = l.accountId;
+    else if (owner[k] !== l.accountId) contested[k] = true;
+  });
+  return { owner: owner, contested: contested };
+}
+
+// The job numbers belonging to this account, with provenance.
+function arJobKeysFor(a) {
+  var keys = {};
+  DB.get(KEYS.jobLinks).forEach(function(l) {
+    if (l.accountId !== a._spId) return;
+    var k = strictJobNum(l.jobNumber);
+    if (k) keys[k] = 'link';
+  });
+  var nm = (a.name || '').toLowerCase().trim();
+  if (nm) {
+    (window.CRM_JOBS || []).forEach(function(j) {
+      if ((j.Client_Name || '').toLowerCase().trim() !== nm) return;
+      var k = strictJobNum(j.Job_Number);          // not || Title — Title is free text
+      if (k && !keys[k]) keys[k] = 'name';
+    });
+  }
+  return keys;
+}
+
+// Open A/R rows for one account. Balance > 0 only — fv_qb.py writes paid rows too,
+// stamped AgingBucket 'Paid'. Contested keys are excluded from the total and
+// reported separately rather than silently credited to one side.
+function arRowsFor(a) {
+  var ctx = arContestedKeys();
+  var keys = arJobKeysFor(a);
+  var nm = (a.name || '').toLowerCase().trim();
+  var mine = [], contested = [];
+  (window.CRM_AR || []).forEach(function(r) {
+    var bal = parseFloat(r.Balance) || 0;
+    if (bal <= 0) return;
+    var k = strictJobNum(r.JobNumber);
+    var hit = k ? !!keys[k] : (!!nm && (r.ClientName || '').toLowerCase().trim() === nm);
+    if (!hit) return;
+    var rec = {
+      jobNumber: k || (r.JobNumber || ''), client: r.ClientName || '',
+      invoiceNumber: r.InvoiceNumber || '', invoiceDate: fmtDate(r.InvoiceDate) || '',
+      dueDate: fmtDate(r.DueDate) || '', amount: parseFloat(r.InvoiceAmount) || 0,
+      paid: parseFloat(r.AmountPaid) || 0, balance: bal,
+      bucket: r.AgingBucket || '', days: parseInt(r.DaysOutstanding, 10) || 0,
+      via: k ? (keys[k] || 'name') : 'client-name'
+    };
+    if (k && ctx.contested[k]) contested.push(rec); else mine.push(rec);
+  });
+  mine.sort(function(x, y) { return y.days - x.days; });
+  return { rows: mine, contested: contested };
+}
+
+// Rows matching no account at all — visible proof that a join miss is a miss
+// rather than a zero.
+function arUnattributed() {
+  var claimed = {}, names = {};
+  DB.get(KEYS.accounts).forEach(function(a) {
+    var nm = (a.name || '').toLowerCase().trim();
+    if (nm) names[nm] = true;
+    Object.keys(arJobKeysFor(a)).forEach(function(k) { claimed[k] = true; });
+  });
+  var n = 0, total = 0;
+  (window.CRM_AR || []).forEach(function(r) {
+    var bal = parseFloat(r.Balance) || 0;
+    if (bal <= 0) return;
+    var k = strictJobNum(r.JobNumber);
+    if (k ? claimed[k] : names[(r.ClientName || '').toLowerCase().trim()]) return;
+    n++; total += bal;
+  });
+  return { count: n, total: total };
+}
+
+// Freshness from the sync's own stamps, not from wall time.
+function arAsOf() {
+  var ts = (window.CRM_AR || []).map(function(r) { return Date.parse(r.Modified); })
+    .filter(function(n) { return !isNaN(n); });
+  if (!ts.length) return null;
+  var newest = Math.max.apply(null, ts);
+  return { at: new Date(newest), hours: (Date.now() - newest) / 3600000 };
+}
+// fv_qb.py runs on a short cadence, so a day of staleness is hundreds of missed
+// runs — the contact-recency thresholds used elsewhere would be far too lax here.
+function arFreshBadge(asOf) {
+  if (!asOf) return '';
+  var h = asOf.hours, cls = h <= 1 ? 'badge-green' : (h <= 6 ? 'badge-amber' : 'badge-red');
+  var txt = h < 1 ? Math.max(1, Math.round(h * 60)) + ' min'
+                  : (h < 48 ? Math.round(h) + ' hr' : Math.round(h / 24) + ' days');
+  return '<span class="badge ' + cls + '" title="Newest QB_AR_Aging row written ' +
+    escHtml(asOf.at.toISOString()) + '">synced ' + txt + ' ago</span>';
+}
+
+const AR_BLOCK_COPY = {
+  loading:     ['Loading A/R&hellip;', ''],
+  unfetched:   ['A/R not loaded yet', 'Press Refresh to read QB_AR_Aging.'],
+  unavailable: ['Could not read QB_AR_Aging', 'The list did not load, so no balance can be shown. This is a data problem, not a zero balance.'],
+  truncated:   ['A/R list too large to total safely', 'QB_AR_Aging returned the maximum ' + AR_TOP + ' rows, so the list is truncated and any total would understate. Not shown.'],
+  empty:       ['QB_AR_Aging is empty', 'The QuickBooks A/R sync has not populated this list, so the CRM cannot see any invoices. This is NOT a zero balance &mdash; check whether fv_qb.py last completed.'],
+  rewriting:   ['A/R sync is mid-write', 'QB_AR_Aging rewrites every row on each run, and these rows were written more than ' + AR_REWRITE_SPREAD_MIN + ' minutes apart, so the list is partial right now. No total shown.'],
+  nojobs:      ['Jobs_Master did not load', 'Without it the CRM cannot tell which invoices belong to this account, so any balance would be understated. Not shown.']
+};
+
+function _acctARTab(el, a) {
+  var reason = arBlockReason();
+  var head = '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">' +
+    '<strong style="font-size:15px">Accounts receivable</strong>' +
+    (reason ? '' : arFreshBadge(arAsOf())) +
+    '<div style="flex:1"></div>' +
+    '<button class="btn btn-sm" onclick="App._arRefresh(' + a._spId + ')"' + (_arLoading ? ' disabled' : '') + '>&#8635; Refresh</button>' +
+    '</div>';
+
+  if (reason) {
+    var copy = AR_BLOCK_COPY[reason] || AR_BLOCK_COPY.unavailable;
+    var warn = reason !== 'loading';
+    el.innerHTML = head +
+      '<div class="card" style="padding:20px;background:' + (warn ? 'var(--warning-50)' : 'var(--surface-subtle)') +
+      ';border-color:' + (warn ? 'var(--warning-500)' : 'var(--border)') + '">' +
+      '<h4 style="font-size:14px;margin-bottom:6px">' + copy[0] + '</h4>' +
+      (copy[1] ? '<div style="font-size:13px;color:var(--text-secondary)">' + copy[1] + '</div>' : '') +
+      '</div>';
+    if (reason === 'unfetched') {
+      loadAR().then(function() {
+        var e2 = document.getElementById('acctTabContent');
+        if (e2) _acctARTab(e2, a);
+      });
+    }
+    return;
+  }
+
+  var res = arRowsFor(a);
+  var rows = res.rows;
+  var open = rows.reduce(function(s, r) { return s + r.balance; }, 0);
+  var currentRows = rows.filter(function(r) { return r.days <= 0 || /current/i.test(r.bucket); });
+  var pastDueTotal = rows.reduce(function(s, r) {
+    return s + (currentRows.indexOf(r) === -1 ? r.balance : 0);
+  }, 0);
+  var oldest = rows.length ? rows[0] : null;
+  var un = arUnattributed();
+
+  if (!rows.length && !res.contested.length) {
+    el.innerHTML = head +
+      '<div class="empty-state"><div class="empty-icon">&#128179;</div><h3>No open A/R</h3>' +
+      '<p style="color:var(--text-secondary)">QuickBooks shows no unpaid invoices attributed to ' +
+      escHtml(a.name) + '.</p></div>' + _arFooter(un, res.contested);
+    return;
+  }
+
+  var cards = '<div style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap">' +
+    '<div class="stat-card" style="flex:1;min-width:150px' + (open > 0 ? ';background:var(--danger-50);border-color:var(--danger-500)' : '') + '">' +
+      '<div class="stat-value"' + (open > 0 ? ' style="color:var(--danger-500)"' : '') + '>' + fmtMoney(open) + '</div>' +
+      '<div class="stat-label">Open balance</div></div>' +
+    '<div class="stat-card" style="flex:1;min-width:150px"><div class="stat-value">' + fmtMoney(pastDueTotal) + '</div><div class="stat-label">Past due</div></div>' +
+    '<div class="stat-card" style="flex:1;min-width:150px"><div class="stat-value">' + (oldest ? oldest.days + 'd' : '&mdash;') + '</div><div class="stat-label">Oldest invoice</div></div>' +
+    '<div class="stat-card" style="flex:1;min-width:150px"><div class="stat-value">' + rows.length + '</div><div class="stat-label">Open invoices</div></div>' +
+    '</div>';
+
+  var table = '<div class="card" style="padding:16px"><div class="table-wrap"><table style="width:100%;font-size:13px">' +
+    '<thead><tr><th style="text-align:left">Invoice</th><th style="text-align:left">Job</th><th style="text-align:left">Due</th>' +
+    '<th style="text-align:right">Amount</th><th style="text-align:right">Paid</th><th style="text-align:right">Balance</th>' +
+    '<th style="text-align:left">Aging</th></tr></thead><tbody>' +
+    rows.map(function(r) {
+      var overdue = r.days > 0;
+      return '<tr>' +
+        '<td>' + (r.invoiceNumber ? escHtml(r.invoiceNumber) : '<span style="color:var(--text-muted)">&mdash;</span>') + '</td>' +
+        '<td>' + escHtml(r.jobNumber || '') + (r.via === 'client-name' ? ' <span class="badge" title="Matched on client name — the invoice carries no job number">name</span>' : '') + '</td>' +
+        '<td>' + escHtml(r.dueDate || '') + '</td>' +
+        '<td style="text-align:right;color:var(--text-muted)">' + fmtMoney(r.amount) + '</td>' +
+        '<td style="text-align:right;color:var(--text-muted)">' + fmtMoney(r.paid) + '</td>' +
+        '<td style="text-align:right;font-weight:600' + (overdue ? ';color:var(--danger-500)' : '') + '">' + fmtMoney(r.balance) + '</td>' +
+        '<td>' + (r.bucket ? '<span class="badge ' + (overdue ? 'badge-red' : 'badge-green') + '">' + escHtml(r.bucket) + '</span>' : '&mdash;') + '</td>' +
+        '</tr>';
+    }).join('') + '</tbody></table></div></div>';
+
+  el.innerHTML = head + cards + table + _arFooter(un, res.contested);
+}
+
+function _arFooter(un, contested) {
+  var out = '';
+  if (contested && contested.length) {
+    out += '<div class="card" style="padding:12px 16px;margin-top:12px;background:var(--warning-50);border-color:var(--warning-500);font-size:13px">' +
+      '<strong>' + contested.length + ' invoice' + (contested.length === 1 ? '' : 's') + ' excluded &mdash; job claimed by more than one account.</strong> ' +
+      'CRM_Job_Links holds conflicting owners for ' + escHtml(contested.map(function(r) { return r.jobNumber; }).join(', ')) +
+      '. Excluded from the total rather than credited to the wrong account.</div>';
+  }
+  if (un && un.count) {
+    out += '<div class="card" style="padding:12px 16px;margin-top:12px;background:var(--surface-subtle);font-size:13px">' +
+      un.count + ' open invoice' + (un.count === 1 ? '' : 's') + ' totalling <strong>' + fmtMoney(un.total) +
+      '</strong> match no CRM account at all &mdash; shown so a join miss is visible rather than silently absent.</div>';
+  }
+  out += '<div style="font-size:11px;color:var(--text-muted);margin-top:10px;line-height:1.5">' +
+    'Source: QB_AR_Aging, written from QuickBooks by fv_qb.py. Figures are <strong>gross open invoice balances</strong> &mdash; ' +
+    'unapplied credit memos and unapplied customer payments are not visible to this source, so a balance here can exceed what ' +
+    'QuickBooks&rsquo; own A/R Aging shows net. Read-only: this panel never writes. ' +
+    'The Residential Client roll-up is not included in v1.</div>';
+  return out;
+}
+
+async function _arRefresh(spId) {
+  await loadAR(true);
+  var el = document.getElementById('acctTabContent');
+  var a = DB.find(KEYS.accounts, spId);
+  if (el && a) _acctARTab(el, a);
+}
+
 """
 
 sub1(
@@ -1141,9 +1438,11 @@ sub1(
     "  // FV_PRICING_PATCH: rate cards\n"
     "  _editPricing, _savePricing, _addRateRow, _removeRateRow, _rateEdit, _seedFromStandard,\n"
     "  _editStandardRates, _saveStandardRates, _resetStandardRates, _addStdRow, _removeStdRow, _stdEdit,\n"
-    "  _pricingFilter, _exportPricingCsv, _setupPricingFields, _runPricingSetup,",
+    "  _pricingFilter, _exportPricingCsv, _setupPricingFields, _runPricingSetup,\n"
+    "  // FV_AR_PANEL\n"
+    "  _arRefresh,",
     'export new functions'
 )
 
-io.open(path, 'w', encoding='utf-8').write(src)
-print('\nPatched OK -> ' + path)
+io.open(out, 'w', encoding='utf-8').write(src)
+print('\nPatched OK -> ' + out)

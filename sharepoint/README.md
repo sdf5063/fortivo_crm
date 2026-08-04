@@ -13,12 +13,15 @@ in the repo root.
 | `gen_standard_rates.py` | The published rate card, transcribed from `rates.json` |
 | `tests/` | Node tests that run against `fortivo_crm.html` directly |
 
-`python3 patch_crm.py fortivo_crm.baseline.html` reproduces `fortivo_crm.html`
-exactly, so the diff is auditable rather than a 293 KB blob.
+`python3 patch_crm.py fortivo_crm.baseline.html fortivo_crm.html` reproduces the
+deployable exactly, so the diff is auditable rather than a 294 KB blob. The script
+refuses to write back over a file named `*baseline*`, because that file is the only
+record of pre-patch production.
 
 ```bash
 node tests/test_pricing_referrals.js   # 56 assertions — helpers, rates, rollup math
 node tests/test_views.js               # 15 assertions — rendered view output
+node tests/test_ar_panel.js            # 47 assertions — A/R states, attribution, no-writes
 ```
 
 ---
@@ -140,6 +143,64 @@ on `Jobs_Master`, which is maintained independently of QuickBooks' customer tree
 The CRM and QB can drift apart without either complaining. Keep `Referred_By`
 populated at job creation — it is what the rollup reads. See
 `docs/qb-crm-streamlining.md`.
+
+---
+
+## 3. A/R on the account view
+
+**The problem.** $262,135.23 — 79% of all receivables — is one FinMarc invoice at
+61–90 days, and the CRM showed no trace of it. The A/R lived in QuickBooks, the
+chase history in Outlook, and the account record knew about neither.
+
+**The panel.** A new **AR** tab on every account: open balance, past due, oldest
+invoice age, invoice count, and the invoice table with aging buckets.
+
+It reads `QB_AR_Aging` (11 columns, written from QuickBooks by `fv_qb.py`) and
+attributes rows to accounts by job number first, client name second. **It writes
+nothing.**
+
+### Why it so often refuses to show a number
+
+An adversarial review of the design turned up more ways to display a confident
+wrong balance than to display a right one. A wrong number shown authoritatively is
+worse than a blank, so the panel states a reason instead of a figure whenever the
+data cannot support one:
+
+| State | Why no number |
+| --- | --- |
+| `unavailable` | The read failed. Not a zero balance. |
+| `empty` | `QB_AR_Aging` has no rows — the sync never populated it. **Not** a zero balance. |
+| `truncated` | Hit the 5000-row cap; `spGet` ignores `odata.nextLink`, so any total would understate. |
+| `rewriting` | `fv_qb.py` clear-then-reinserts every row. A `Modified` spread over 5 minutes means a partial list. |
+| `nojobs` | `Jobs_Master` did not load, so ownership is unknowable and the balance would be understated. |
+
+The cache is genuinely three-state — `undefined` / `null` / array — and is never
+defaulted to `[]`, because `[]` is indistinguishable from "nothing owed".
+
+### Other correctness decisions
+
+- **Lazy fetch, not in `loadData`.** Four of the seven reads in that `Promise.all`
+  have no `.catch`, so widening it makes a whole-batch abort likelier — which in
+  turn feeds the `Job_Value` backfill a partial picture.
+- **`cache: 'no-store'` via a dedicated `spGetNoStore`.** A service worker is
+  registered with a scope covering `/_api/`; money must not come from Cache
+  Storage. `spGet` is left alone — it has other callers.
+- **Contested jobs are excluded, not credited.** `CRM_Job_Links` has no uniqueness
+  constraint and `_syncQBRevenue` dedupes on the raw label, so one job can be
+  claimed by two accounts. Those rows are withheld from both totals and named.
+- **Unattributed rows are surfaced** with a count and total, so a join miss looks
+  like a miss instead of an absence.
+- **Anchored job-number matching.** `normJobNum` finds a job number anywhere, so
+  `2026-01-000210` would yield `26-01-00021`; `strictJobNum` requires a standalone
+  match before money is attributed.
+- **Freshness thresholds suit the sync cadence** — green ≤1h, amber ≤6h, red after.
+  The contact-recency thresholds used elsewhere would call a day-dead sync fresh.
+- **Gross, not net.** The source is `SELECT * FROM Invoice WHERE Balance > '0'`, so
+  unapplied credit memos and payments are invisible and a balance here can exceed
+  QuickBooks' net figure. The panel says so on screen.
+
+Excluded from v1: the Residential Client roll-up, and any chase-email drafting —
+the latter is where a wrong figure would reach a customer.
 
 ---
 
