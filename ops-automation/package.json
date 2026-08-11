@@ -1,0 +1,9 @@
+{
+  "name": "fortivo-ops-automation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fortivo Ops Automation Kit — job kickoff folder scaffolding + invoice→QuickBooks pipeline (create-only, audit-logged)",
+  "scripts": {
+    "test": "node test/test_kickoff_logic.js && node test/test_invoice_logic.js && node test/test_qbo_relay.js"
+  }
+}

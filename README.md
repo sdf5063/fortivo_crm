@@ -1,3 +1,9 @@
+> **📦 Ops Automation Kit lives here:** see [`ops-automation/`](ops-automation/)
+> — Job Kickoff (folder + contract scaffolding) and Invoice → QuickBooks Desk
+> for the SharePoint Operations Dashboard apps. Start with
+> [`ops-automation/BLUEPRINT.md`](ops-automation/BLUEPRINT.md).
+> The Flask demo CRM below is dormant and unchanged.
+
 # Fortivo CRM
 
 Fortivo CRM is a lightweight web‑based customer relationship management (CRM)

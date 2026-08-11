@@ -1,0 +1,717 @@
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     FORTIVO INVOICE → QUICKBOOKS DESK (FVQ) — self-contained drop-in block
+     ───────────────────────────────────────────────────────────────────────────
+     Paste this ENTIRE block into fortivo_invoicing.html directly BEFORE </body>.
+     Namespaced (fvq- prefixed), no changes to the app's own code. External
+     dependencies: the qbo-invoice relay endpoint for step 2 only (steps 3-4
+     work without it — see INTEGRATION.md), plus two pinned CDN libraries
+     loaded on demand for steps 3-4 (pdf-lib and msal-browser from jsdelivr;
+     SRI pinning supported via FVQ_CFG.SRI, generator one-liner in
+     INTEGRATION.md — the PWA service worker already caches jsdelivr URLs).
+
+     Replaces the manual invoice ritual with a 4-step desk:
+       1. PICK    — choose an invoice from the Invoices list (un-synced first)
+       2. QB SYNC — create the matching invoice in QuickBooks via the relay;
+                    QuickBooks assigns the invoice number; it is written back
+                    to the SP row (QB_Invoice_Number) automatically
+       3. STAMP   — put the QB number into the PDF and FLATTEN it (pdf-lib);
+                    fills a matching form field when the PDF has one, otherwise
+                    stamps text; saves a copy — the original is never modified
+       4. EMAIL   — creates an Outlook DRAFT with the standard wording (incl.
+                    "you'll also get the same invoice through QuickBooks — pay
+                    online or by mail") and the stamped PDF attached.
+                    YOU review and press Send in Outlook. Nothing auto-sends.
+
+     DATA SAFETY: create-only. No deletes, no overwrites, no auto-sends.
+     Duplicate-guard: an invoice that already has a QB number can't be synced
+     again from here.
+     ═══════════════════════════════════════════════════════════════════════ -->
+<style>
+  #fvq-fab{position:fixed;right:18px;bottom:30px;z-index:99990;background:#19345E;color:#fff;
+    border:2px solid #1292D1;border-radius:26px;padding:12px 18px;font-size:15px;font-weight:600;
+    cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+  #fvq-fab:hover{background:#1292D1}
+  #fvq-overlay{position:fixed;inset:0;background:rgba(10,20,40,.55);z-index:99998;display:none}
+  #fvq-modal{position:fixed;z-index:99999;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:min(720px,94vw);max-height:90vh;overflow:auto;background:#fff;border-radius:12px;
+    box-shadow:0 12px 40px rgba(0,0,0,.45);display:none;color:#1c2b3a;-webkit-overflow-scrolling:touch}
+  .fvq-head{background:#19345E;color:#fff;padding:14px 18px;border-radius:12px 12px 0 0;display:flex;
+    justify-content:space-between;align-items:center;position:sticky;top:0;z-index:2}
+  .fvq-head h3{margin:0;font-size:17px}
+  .fvq-x{background:none;border:none;color:#fff;font-size:22px;cursor:pointer;min-width:44px;min-height:44px}
+  .fvq-steps{display:flex;gap:4px;padding:12px 18px 0;flex-wrap:wrap}
+  .fvq-chip{padding:6px 12px;border-radius:14px;font-size:12px;font-weight:700;background:#eef2f7;color:#5a6b7e}
+  .fvq-chip.on{background:#1292D1;color:#fff}
+  .fvq-chip.done{background:#e2f2e5;color:#1c7a34}
+  .fvq-body{padding:14px 18px 22px}
+  .fvq-row{margin-bottom:12px}
+  .fvq-row label{display:block;font-size:12px;font-weight:700;color:#19345E;text-transform:uppercase;letter-spacing:.4px;margin-bottom:4px}
+  .fvq-row input[type=text],.fvq-row input[type=email],.fvq-row select,.fvq-row textarea{width:100%;box-sizing:border-box;
+    padding:10px;border:1px solid #c6d2e0;border-radius:8px;font-size:14px;background:#fff;color:#1c2b3a}
+  .fvq-row textarea{min-height:90px;resize:vertical}
+  .fvq-hint{font-size:12px;color:#5a6b7e;margin-top:3px}
+  .fvq-btn{border:none;border-radius:8px;padding:12px 20px;font-size:15px;font-weight:700;cursor:pointer;min-height:44px}
+  .fvq-btn.primary{background:#1292D1;color:#fff}
+  .fvq-btn.primary:disabled{background:#9db8c9;cursor:not-allowed}
+  .fvq-btn.ghost{background:#eef2f7;color:#19345E}
+  .fvq-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap}
+  .fvq-list{max-height:260px;overflow:auto;border:1px solid #dbe4ef;border-radius:8px}
+  .fvq-list div{padding:10px 12px;border-bottom:1px solid #eef2f7;cursor:pointer;font-size:14px}
+  .fvq-list div:hover{background:#eaf4fb}
+  .fvq-tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700;margin-left:6px}
+  .fvq-tag.no{background:#fdf1d7;color:#8a6100}
+  .fvq-tag.yes{background:#e2f2e5;color:#1c7a34}
+  .fvq-card{background:#f4f7fb;border:1px solid #dbe4ef;border-radius:8px;padding:12px;font-size:14px;margin-bottom:12px}
+  .fvq-big{font-size:26px;font-weight:800;color:#19345E;letter-spacing:.5px}
+  .fvq-ok{color:#1c7a34;font-weight:700}
+  .fvq-warn{color:#8a6100;font-weight:700}
+  .fvq-err{color:#b3261e;font-weight:700}
+  .fvq-spin{display:inline-block;width:14px;height:14px;border:2px solid #1292D1;border-top-color:transparent;border-radius:50%;
+    animation:fvqspin .8s linear infinite;vertical-align:-2px}
+  @keyframes fvqspin{to{transform:rotate(360deg)}}
+  .fvq-status{margin-top:10px;font-size:14px}
+  .fvq-status a{color:#1292D1;font-weight:700;word-break:break-all}
+  @media (max-width:640px){ .fvq-body{padding:12px 12px 18px} }
+</style>
+
+<button id="fvq-fab" type="button" title="Invoice → QuickBooks → PDF → Email desk">🧾 QB Invoice Desk</button>
+<div id="fvq-overlay"></div>
+<div id="fvq-modal" role="dialog" aria-modal="true" aria-label="QuickBooks Invoice Desk">
+  <div class="fvq-head"><h3>🧾 Invoice Desk — QuickBooks · PDF · Email</h3>
+    <button class="fvq-x" id="fvq-close" aria-label="Close">×</button></div>
+  <div class="fvq-steps" id="fvq-steps"></div>
+  <div class="fvq-body" id="fvq-body"></div>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ── CONFIG ───────────────────────────────────────────────────────────────── */
+var FVQ_CFG = {
+  HOST: (typeof location !== 'undefined' && location.origin) || 'https://fortivopropertyservices.sharepoint.com',
+  OPS_SITE: '/sites/FortivoOperations',
+  JOBS_SITE: '/sites/ActiveJobs',
+  ACTIVE_ROOT: '/sites/ActiveJobs/Shared Documents/01_Active Jobs/01_Job Name',
+  INVOICES_LIST: 'Invoices',
+  INVOICES_ENTITY: 'SP.Data.InvoicesListItem',
+  JOB_INVOICE_SUBFOLDER: '08_Invoices',
+  LOG_LIST: 'Automation_Log',                            // best-effort audit trail (same list Kickoff uses)
+  // Relay (fortivo-voice-email project). Set RELAY_KEY to the relay's API_KEY env value.
+  RELAY_URL: 'https://fortivo-voice-email.vercel.app/api/qbo-invoice',
+  RELAY_KEY: 'SET-ME',                                   // ← required for step 2 only
+  // Existing Azure AD app "Fortivo Voice Email" — add delegated Mail.ReadWrite (see INTEGRATION.md)
+  AAD_CLIENT_ID: 'cbec554b-4222-4c5b-a1b8-e51133955bb3',
+  GRAPH_SCOPES: ['Mail.ReadWrite'],
+  MSAL_CDN: 'https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js',
+  PDFLIB_CDN: 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js',
+  // Recommended: pin subresource-integrity hashes for the two CDN libs above
+  // (one-liner to generate them is in INTEGRATION.md). Empty = no pinning.
+  SRI: { MSAL: '', PDFLIB: '' },
+  // Text stamp fallback position (PDF points; origin = bottom-left). Tune once if needed.
+  STAMP: { fromRight: 200, fromTop: 90, size: 11, label: 'Invoice #: ' },
+  COMPANY: {
+    name: 'Fortivo Property Services, LLC', phone: '(301) 822-2266',
+    ar: 'AR@Fortivo.com', web: 'www.Fortivo.com', terms: 'Net 25',
+    surcharge: 'Payments by credit cards are assessed a 3% processing fee.'
+  }
+};
+
+/* ── PURE LOGIC (FVInvoiceQB._logic — covered by the node test suite) ─────── */
+var FVQ_L = {
+  money: function(n){
+    var v = Number(n || 0);
+    return '$' + v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  },
+  firstName: function(clientName){
+    var s = String(clientName || '').trim();
+    if (!s) return '';
+    // "Last, First" → First ; otherwise first word
+    if (s.indexOf(',') !== -1) return s.split(',')[1].trim().split(/\s+/)[0] || s;
+    return s.split(/\s+/)[0];
+  },
+  parseLineItems: function(json){
+    try {
+      var arr = JSON.parse(json || '[]');
+      if (!Array.isArray(arr)) return [];
+      return arr.map(function(li){
+        return {
+          description: String(li.description || li.desc || li.name || li.item || 'Services'),
+          amount: Math.round((Number(li.amount || li.total || li.price || 0)) * 100) / 100,
+          quantity: Number(li.qty || li.quantity || 1) || 1
+        };
+      }).filter(function(li){ return Number(li.amount) !== 0; });
+      // $0 informational rows are dropped (QBO rejects them); negative rows are
+      // kept so step 2 can block the sync with a clear explanation instead of
+      // silently changing the invoice total.
+    } catch (e){ return []; }
+  },
+  hasNegativeLines: function(lines){
+    return (lines || []).some(function(li){ return Number(li.amount) < 0; });
+  },
+  // Payload for the qbo-invoice relay — internalNumber is the idempotency key
+  buildQboPayload: function(row, clientEmail){
+    var lines = FVQ_L.parseLineItems(row.Line_Items_JSON);
+    if (!lines.length && Number(row.Total)) {
+      lines = [{ description: (row.Job_Name || row.Job_Number || 'Restoration services') + ' — see attached invoice detail', amount: Number(row.Total), quantity: 1 }];
+    }
+    return {
+      internalNumber: row.Title,
+      jobNumber: row.Job_Number || '',
+      clientName: row.Client_Name || '',
+      clientEmail: clientEmail || '',
+      txnDate: (row.Invoice_Date || '').slice(0, 10) || undefined,
+      dueDate: (row.Due_Date || '').slice(0, 10) || undefined,
+      memo: 'Job ' + (row.Job_Number || '') + (row.Property_Address ? ' — ' + row.Property_Address : ''),
+      total: Number(row.Total || 0),
+      lineItems: lines
+    };
+  },
+  sumLines: function(lines){
+    return Math.round((lines || []).reduce(function(a, li){ return a + Number(li.amount || 0); }, 0) * 100) / 100;
+  },
+  stampName: function(originalName, docNumber){
+    var dot = originalName.lastIndexOf('.');
+    var stem = dot > 0 ? originalName.slice(0, dot) : originalName;
+    return stem + ' - INV ' + docNumber + '.pdf';
+  },
+  isInvoiceNumberField: function(fieldName){
+    var n = String(fieldName || '').toLowerCase();
+    return /invoice/.test(n) && /(number|num|no\b|no_|#)/.test(n);
+  },
+  buildEmail: function(o){
+    var esc = function(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]; }); };
+    var first = esc(FVQ_L.firstName(o.clientName));
+    var doc = esc(o.docNumber);
+    var subject = 'Fortivo Property Services — Invoice ' + o.docNumber +
+      (o.jobNumber ? ' — Job ' + o.jobNumber : '');
+    var due = o.dueDate ? new Date(o.dueDate + 'T12:00:00').toLocaleDateString('en-US', { month:'long', day:'numeric', year:'numeric' }) : '';
+    var html =
+      '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#1c2b3a;line-height:1.55">' +
+      '<p>' + (first ? 'Hi ' + first + ',' : 'Hello,') + '</p>' +
+      '<p>Please find attached invoice <b>' + doc + '</b>' +
+      (o.address ? ' for the work at <b>' + esc(o.address) + '</b>' : '') +
+      (o.total ? ', in the amount of <b>' + FVQ_L.money(o.total) + '</b>' : '') +
+      (due ? ', due <b>' + due + '</b> (' + FVQ_CFG.COMPANY.terms + ')' : ' (terms: ' + FVQ_CFG.COMPANY.terms + ')') + '.</p>' +
+      '<p>You will also receive this same invoice through <b>QuickBooks</b> — you can pay online through that email, ' +
+      'or by mail with a check to the address on the invoice. Whichever is easier for you.</p>' +
+      (o.extraNote ? '<p>' + esc(o.extraNote) + '</p>' : '') +
+      '<p style="font-size:12px;color:#5a6b7e">' + FVQ_CFG.COMPANY.surcharge + '</p>' +
+      '<p>Any questions about this invoice, just reply here or reach us at ' +
+      '<a href="mailto:' + FVQ_CFG.COMPANY.ar + '">' + FVQ_CFG.COMPANY.ar + '</a> / ' + FVQ_CFG.COMPANY.phone + '.</p>' +
+      '<p>Thank you for your business!</p>' +
+      '<p><b style="color:#19345E">' + FVQ_CFG.COMPANY.name + '</b><br>' +
+      FVQ_CFG.COMPANY.phone + ' · ' + FVQ_CFG.COMPANY.web + '</p></div>';
+    return { subject: subject, html: html };
+  }
+};
+
+/* ── SP REST HELPERS ──────────────────────────────────────────────────────── */
+var FVQ_digests = {};
+function fvqEsc(p){ return encodeURIComponent(String(p).replace(/'/g, "''")); }
+function fvqEscHtml(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+  return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]; }); }
+function fvqDigest(site){
+  var d = FVQ_digests[site];
+  if (d && d.exp > Date.now()) return Promise.resolve(d.value);
+  return fetch(FVQ_CFG.HOST + site + '/_api/contextinfo', { method:'POST',
+    headers:{ Accept:'application/json;odata=nometadata' }, credentials:'same-origin' })
+    .then(function(r){ if (!r.ok) throw new Error('contextinfo ' + r.status); return r.json(); })
+    .then(function(j){
+      var v = j.FormDigestValue || (j.d && j.d.GetContextWebInformation && j.d.GetContextWebInformation.FormDigestValue);
+      FVQ_digests[site] = { value:v, exp: Date.now() + 20*60*1000 }; return v;
+    });
+}
+function fvqGet(site, apiPath){
+  return fetch(FVQ_CFG.HOST + site + '/_api/' + apiPath, {
+    headers:{ Accept:'application/json;odata=nometadata' }, credentials:'same-origin' });
+}
+function fvqPost(site, apiPath, opts){
+  opts = opts || {};
+  return fvqDigest(site).then(function(dig){
+    return fetch(FVQ_CFG.HOST + site + '/_api/' + apiPath, {
+      method:'POST', credentials:'same-origin',
+      headers: Object.assign({ Accept:'application/json;odata=verbose', 'X-RequestDigest':dig }, opts.headers || {}),
+      body: opts.body });
+  });
+}
+function fvqLoadInvoices(){
+  return fvqGet(FVQ_CFG.OPS_SITE, "web/lists/getbytitle('" + FVQ_CFG.INVOICES_LIST + "')/items?$orderby=Id desc&$top=200")
+    .then(function(r){ if (!r.ok) throw new Error('Invoices list read failed (' + r.status + ')'); return r.json(); })
+    .then(function(j){ return (j.value || []).filter(function(x){ return x.Status !== 'Cancelled'; }); });
+}
+function fvqPatchInvoice(id, fields){
+  var body = Object.assign({ __metadata:{ type: FVQ_CFG.INVOICES_ENTITY } }, fields);
+  return fvqPost(FVQ_CFG.OPS_SITE, "web/lists/getbytitle('" + FVQ_CFG.INVOICES_LIST + "')/items(" + id + ")", {
+    headers:{ 'Content-Type':'application/json;odata=verbose', 'IF-MATCH':'*', 'X-HTTP-Method':'MERGE' },
+    body: JSON.stringify(body)
+  }).then(function(r){
+    if (!(r.ok || r.status === 204)) return r.text().then(function(t){ throw new Error('SP write-back failed: ' + t.slice(0,200)); });
+  });
+}
+function fvqFindJobFolder(jobNumber){
+  return fvqGet(FVQ_CFG.JOBS_SITE, "web/GetFolderByServerRelativePath(DecodedUrl=@f)/Folders?@f='" + fvqEsc(FVQ_CFG.ACTIVE_ROOT) + "'&$select=Name,ServerRelativeUrl&$top=500")
+    .then(function(r){ return r.ok ? r.json() : { value: [] }; })
+    .then(function(j){
+      var p = String(jobNumber || '').trim().toLowerCase();
+      return (j.value || []).find(function(f){ return p && f.Name.toLowerCase().indexOf(p) === 0; }) || null;
+    });
+}
+function fvqListPdfs(folderRel){
+  return fvqGet(FVQ_CFG.JOBS_SITE, "web/GetFolderByServerRelativePath(DecodedUrl=@f)/Files?@f='" + fvqEsc(folderRel) + "'&$select=Name,ServerRelativeUrl,TimeLastModified&$top=200")
+    .then(function(r){ return r.ok ? r.json() : { value: [] }; })
+    .then(function(j){ return (j.value || []).filter(function(f){ return /\.pdf$/i.test(f.Name); }); });
+}
+function fvqDownload(site, fileRel){
+  return fvqGet(site, "web/GetFileByServerRelativePath(DecodedUrl=@f)/$value?@f='" + fvqEsc(fileRel) + "'")
+    .then(function(r){ if (!r.ok) throw new Error('PDF download ' + r.status); return r.arrayBuffer(); });
+}
+function fvqLogRun(entry){ // best-effort audit; never blocks or throws
+  var body = JSON.stringify({
+    __metadata:{ type:'SP.Data.Automation_x005f_LogListItem' },
+    Title: entry.action || 'Invoice Desk',
+    Job_Number: entry.jobNumber || '',
+    Result: entry.result || '',
+    Details: JSON.stringify(entry.details || {}).slice(0, 60000)
+  });
+  return fvqPost(FVQ_CFG.OPS_SITE, "web/lists/getbytitle('" + FVQ_CFG.LOG_LIST + "')/items", {
+    headers:{ 'Content-Type':'application/json;odata=verbose' }, body: body
+  }).catch(function(){ /* list may not exist yet — fine */ });
+}
+// Fresh single-row read of QB_Invoice_Number — the anti-stale/anti-race guard
+// used right before any QB sync or manual number write.
+function fvqFreshQbNumber(id){
+  return fvqGet(FVQ_CFG.OPS_SITE, "web/lists/getbytitle('" + FVQ_CFG.INVOICES_LIST + "')/items(" + id + ")?$select=QB_Invoice_Number")
+    .then(function(r){ return r.ok ? r.json() : {}; })
+    .then(function(x){ return x.QB_Invoice_Number || ''; });
+}
+function fvqUpload(site, folderRel, name, bytes){ // create-only
+  return fvqPost(site, "web/GetFolderByServerRelativePath(DecodedUrl=@f)/Files/AddUsingPath(DecodedUrl=@n,overwrite=@o)?@f='" +
+    fvqEsc(folderRel) + "'&@n='" + fvqEsc(name) + "'&@o=false",
+    { headers:{ 'Content-Type':'application/octet-stream' }, body: bytes })
+    .then(function(r){
+      if (r.ok) return { uploaded:true };
+      return r.text().then(function(t){
+        if (/already exists|-2130575257/i.test(t)) return { uploaded:false, existed:true };
+        throw new Error('upload failed: ' + t.slice(0,200));
+      });
+    });
+}
+
+/* ── DYNAMIC LIBS ─────────────────────────────────────────────────────────── */
+function fvqLoadScript(src, integrity){
+  return new Promise(function(res, rej){
+    var s = document.createElement('script');
+    s.src = src;
+    if (integrity){ s.integrity = integrity; s.crossOrigin = 'anonymous'; }
+    s.onload = res; s.onerror = function(){ rej(new Error('Failed to load ' + src)); };
+    document.head.appendChild(s);
+  });
+}
+function fvqPdfLib(){
+  return (typeof PDFLib !== 'undefined') ? Promise.resolve(window.PDFLib)
+    : fvqLoadScript(FVQ_CFG.PDFLIB_CDN, FVQ_CFG.SRI.PDFLIB).then(function(){ return window.PDFLib; });
+}
+var FVQ_msalApp = null, FVQ_msalReady = null;
+// Preloaded when the desk opens, so the interactive sign-in button can call
+// the popup SYNCHRONOUSLY inside its click handler — iOS Safari blocks popups
+// opened from async continuations.
+function fvqEnsureMsal(){
+  if (FVQ_msalReady) return FVQ_msalReady;
+  FVQ_msalReady = ((typeof msal !== 'undefined') ? Promise.resolve() : fvqLoadScript(FVQ_CFG.MSAL_CDN, FVQ_CFG.SRI.MSAL))
+    .then(function(){
+      if (!FVQ_msalApp){
+        var tenant = (typeof _spPageContextInfo !== 'undefined' && _spPageContextInfo.aadTenantId) || 'organizations';
+        FVQ_msalApp = new msal.PublicClientApplication({
+          auth:{ clientId: FVQ_CFG.AAD_CLIENT_ID, authority:'https://login.microsoftonline.com/' + tenant, redirectUri: location.origin },
+          cache:{ cacheLocation:'localStorage' }
+        });
+      }
+      return FVQ_msalApp;
+    });
+  return FVQ_msalReady;
+}
+// Silent-only acquisition. When interaction is required it throws
+// {needsInteraction:true} and the UI shows a dedicated sign-in button.
+function fvqTokenSilent(){
+  return fvqEnsureMsal().then(function(app){
+    var acct = app.getAllAccounts()[0];
+    if (!acct) throw { needsInteraction: true };
+    return app.acquireTokenSilent({ scopes: FVQ_CFG.GRAPH_SCOPES, account: acct })
+      .then(function(r){ return r.accessToken; })
+      .catch(function(){ throw { needsInteraction: true }; });
+  });
+}
+
+/* ── STAMP & FLATTEN ──────────────────────────────────────────────────────── */
+function fvqStampPdf(bytes, docNumber){
+  return fvqPdfLib().then(function(PDFLib){
+    return PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true }).then(function(doc){
+      var stamped = false, method = 'text';
+      try {
+        var form = doc.getForm();
+        var fields = form.getFields();
+        for (var i = 0; i < fields.length; i++){
+          var f = fields[i];
+          // instanceof survives minification; constructor.name does not
+          if ((f instanceof PDFLib.PDFTextField) && FVQ_L.isInvoiceNumberField(f.getName())){
+            f.setText(String(docNumber)); stamped = true; method = 'form:' + f.getName();
+          }
+        }
+        // flatten (→ uneditable, like the manual ritual) only when we actually
+        // filled a field — otherwise leave the form untouched and text-stamp
+        if (stamped) form.flatten();
+      } catch (e){ /* no AcroForm — fall through to text stamp */ }
+      if (!stamped){
+        return doc.embedFont(PDFLib.StandardFonts.HelveticaBold).then(function(font){
+          var page = doc.getPages()[0];
+          var text = FVQ_CFG.STAMP.label + docNumber;
+          page.drawText(text, {
+            x: page.getWidth() - FVQ_CFG.STAMP.fromRight,
+            y: page.getHeight() - FVQ_CFG.STAMP.fromTop,
+            size: FVQ_CFG.STAMP.size, font: font, color: PDFLib.rgb(0.098, 0.204, 0.369)
+          });
+          return doc.save().then(function(out){ return { bytes: out, method: 'text' }; });
+        });
+      }
+      return doc.save().then(function(out){ return { bytes: out, method: method }; });
+    });
+  });
+}
+
+/* ── UI STATE MACHINE ─────────────────────────────────────────────────────── */
+var FVQ_S = { step: 1, rows: [], row: null, docNumber: '', stamped: null, stampedName: '', jobFolder: null, clientEmail: '' };
+function fvqEl(id){ return document.getElementById(id); }
+function fvqSteps(){
+  var names = ['1 · Pick invoice', '2 · QuickBooks', '3 · Stamp PDF', '4 · Email draft'];
+  fvqEl('fvq-steps').innerHTML = names.map(function(n, i){
+    var cls = (i + 1) < FVQ_S.step ? 'done' : (i + 1) === FVQ_S.step ? 'on' : '';
+    return '<span class="fvq-chip ' + cls + '">' + n + '</span>';
+  }).join('');
+}
+function fvqOpen(){
+  fvqEl('fvq-overlay').style.display = 'block';
+  fvqEl('fvq-modal').style.display = 'block';
+  FVQ_S = { step:1, rows:[], row:null, docNumber:'', stamped:null, stampedName:'', jobFolder:null, clientEmail:'', busy:false };
+  fvqEnsureMsal().catch(function(){ /* preload only — real errors surface at step 4 */ });
+  fvqRender();
+}
+function fvqClose(){ fvqEl('fvq-overlay').style.display = 'none'; fvqEl('fvq-modal').style.display = 'none'; }
+
+function fvqRender(){
+  fvqSteps();
+  if (FVQ_S.step === 1) return fvqStep1();
+  if (FVQ_S.step === 2) return fvqStep2();
+  if (FVQ_S.step === 3) return fvqStep3();
+  return fvqStep4();
+}
+
+function fvqStep1(){
+  var b = fvqEl('fvq-body');
+  b.innerHTML = '<div class="fvq-row"><label>Choose invoice</label>' +
+    '<input type="text" id="fvq-q" placeholder="Search invoice #, client, job…"><div class="fvq-list" id="fvq-list">Loading…</div>' +
+    '<div class="fvq-hint">Un-synced invoices are listed first. Invoices already in QuickBooks show their QB number.</div></div>';
+  fvqLoadInvoices().then(function(rows){
+    rows.sort(function(a, b2){ return (a.QB_Invoice_Number ? 1 : 0) - (b2.QB_Invoice_Number ? 1 : 0); });
+    FVQ_S.rows = rows;
+    var draw = function(list){
+      var el = fvqEl('fvq-list');
+      el.innerHTML = list.length ? '' : '<div style="padding:10px;color:#5a6b7e">No invoices found</div>';
+      list.slice(0, 50).forEach(function(r){
+        var d = document.createElement('div');
+        d.innerHTML = '<b>' + fvqEscHtml(r.Title) + '</b> — ' + fvqEscHtml(r.Client_Name || '') + ' — ' + FVQ_L.money(r.Total) +
+          (r.QB_Invoice_Number ? '<span class="fvq-tag yes">QB #' + fvqEscHtml(r.QB_Invoice_Number) + '</span>' : '<span class="fvq-tag no">not in QB</span>') +
+          '<div class="fvq-hint">' + fvqEscHtml(r.Job_Number || '') + ' · ' + fvqEscHtml(r.Status || '') + '</div>';
+        d.onclick = function(){
+          FVQ_S.row = r; FVQ_S.docNumber = r.QB_Invoice_Number || ''; FVQ_S.step = 2; fvqRender();
+        };
+        el.appendChild(d);
+      });
+    };
+    draw(rows);
+    fvqEl('fvq-q').oninput = function(){
+      var q = this.value.toLowerCase();
+      draw(rows.filter(function(r){
+        return ((r.Title || '') + ' ' + (r.Client_Name || '') + ' ' + (r.Job_Number || '')).toLowerCase().indexOf(q) !== -1;
+      }));
+    };
+  }).catch(function(e){
+    fvqEl('fvq-list').innerHTML = '<div class="fvq-err" style="padding:10px">' + fvqEscHtml(e.message) + '</div>';
+  });
+}
+
+function fvqStep2(){
+  var r = FVQ_S.row, b = fvqEl('fvq-body');
+  var lines = FVQ_L.parseLineItems(r.Line_Items_JSON);
+  var mismatch = lines.length && Math.abs(FVQ_L.sumLines(lines) - Number(r.Total || 0)) > 0.5;
+  var negative = FVQ_L.hasNegativeLines(lines);
+  b.innerHTML =
+    '<div class="fvq-card"><b>' + fvqEscHtml(r.Title) + '</b> — ' + fvqEscHtml(r.Client_Name || '') + '<br>' +
+    fvqEscHtml(r.Job_Number || '') + (r.Property_Address ? ' · ' + fvqEscHtml(r.Property_Address) : '') + '<br>' +
+    'Total: <b>' + FVQ_L.money(r.Total) + '</b> · ' + lines.length + ' billable line item(s)' +
+    (mismatch ? '<div class="fvq-warn">⚠ Billable lines sum to ' + FVQ_L.money(FVQ_L.sumLines(lines)) + ' ≠ Total — double-check before syncing ($0 note lines are not sent to QuickBooks).</div>' : '') +
+    (negative ? '<div class="fvq-err">✗ This invoice has negative (credit/discount) lines — the QuickBooks sync can\'t send those. Net the discount into a line item, or use "Skip" and create the QB invoice by hand.</div>' : '') +
+    '</div>' +
+    (r.QB_Invoice_Number
+      ? '<div class="fvq-card"><span class="fvq-ok">✓ Already in QuickBooks:</span> <span class="fvq-big">#' + fvqEscHtml(r.QB_Invoice_Number) + '</span>' +
+        '<div class="fvq-hint">Duplicate-guard: this desk will not create it twice. Continue to stamping.</div></div>'
+      : '<div class="fvq-row"><label>Client email for the QuickBooks invoice (optional)</label>' +
+        '<input type="email" id="fvq-email" placeholder="client@example.com">' +
+        '<div class="fvq-hint">Saved on the QuickBooks customer so QB can email its copy for online payment.</div></div>') +
+    '<div class="fvq-actions">' +
+      '<button class="fvq-btn ghost" id="fvq-back">← Back</button>' +
+      (r.QB_Invoice_Number
+        ? '<button class="fvq-btn primary" id="fvq-next">Continue → Stamp PDF</button>'
+        : '<button class="fvq-btn primary" id="fvq-sync">Create matching invoice in QuickBooks</button>' +
+          '<button class="fvq-btn ghost" id="fvq-skip">Skip (enter QB # by hand)</button>') +
+    '</div><div class="fvq-status" id="fvq-st"></div>';
+  fvqEl('fvq-back').onclick = function(){ FVQ_S.step = 1; fvqRender(); };
+  if (r.QB_Invoice_Number){ fvqEl('fvq-next').onclick = function(){ FVQ_S.step = 3; fvqRender(); }; return; }
+
+  function setBusy(on){
+    FVQ_S.busy = on;
+    ['fvq-sync','fvq-skip','fvq-back'].forEach(function(id){ var el = fvqEl(id); if (el) el.disabled = on; });
+  }
+  function alreadyLinked(fresh){
+    r.QB_Invoice_Number = fresh; FVQ_S.docNumber = fresh;
+    fvqEl('fvq-st').innerHTML = '<span class="fvq-warn">⚠ This invoice was already synced (QB #' + fvqEscHtml(fresh) +
+      ') — probably from another device. Using that number.</span>';
+    setTimeout(function(){ fvqRender(); }, 1200);
+  }
+
+  fvqEl('fvq-skip').onclick = function(){
+    if (FVQ_S.busy) return;
+    var n = prompt('QuickBooks invoice number (from QB):', '');
+    if (!n) return;
+    setBusy(true);
+    fvqFreshQbNumber(r.Id).then(function(fresh){
+      if (fresh){ setBusy(false); alreadyLinked(fresh); return; }
+      return fvqPatchInvoice(r.Id, { QB_Invoice_Number: String(n).trim() }).then(function(){
+        r.QB_Invoice_Number = String(n).trim(); FVQ_S.docNumber = r.QB_Invoice_Number;
+        fvqLogRun({ action:'Invoice Desk — QB # set manually', jobNumber:r.Job_Number, result:'Success',
+          details:{ invoice:r.Title, qbNumber:r.QB_Invoice_Number } });
+        FVQ_S.step = 3; fvqRender();
+      });
+    }).catch(function(e){ setBusy(false); fvqEl('fvq-st').innerHTML = '<span class="fvq-err">' + fvqEscHtml(e.message) + '</span>'; });
+  };
+
+  if (negative){ fvqEl('fvq-sync').disabled = true; }
+  fvqEl('fvq-sync').onclick = function(){
+    if (FVQ_S.busy) return;
+    if (FVQ_CFG.RELAY_KEY === 'SET-ME'){
+      fvqEl('fvq-st').innerHTML = '<span class="fvq-err">Relay key not configured — set FVQ_CFG.RELAY_KEY (see INTEGRATION.md), or use "Skip".</span>'; return;
+    }
+    var st = fvqEl('fvq-st');
+    setBusy(true);                                  // double-tap guard — re-enabled only on error
+    st.innerHTML = '<span class="fvq-spin"></span> Checking the invoice record is still un-synced…';
+    FVQ_S.clientEmail = (fvqEl('fvq-email').value || '').trim();
+    fvqFreshQbNumber(r.Id).then(function(fresh){
+      if (fresh){ setBusy(false); alreadyLinked(fresh); throw { fvqAbort:true }; }
+      st.innerHTML = '<span class="fvq-spin"></span> Creating invoice in QuickBooks…';
+      var payload = FVQ_L.buildQboPayload(r, FVQ_S.clientEmail);
+      return fetch(FVQ_CFG.RELAY_URL, {
+        method:'POST', headers:{ 'Content-Type':'application/json', 'x-api-key': FVQ_CFG.RELAY_KEY },
+        body: JSON.stringify({ invoice: payload })
+      });
+    }).then(function(resp){ return resp.json().then(function(j){ return { ok: resp.ok, j: j }; }); })
+      .then(function(res){
+        if (!res.ok || !res.j.ok) throw new Error(res.j.error || 'Relay error');
+        if (!res.j.docNumber){
+          throw new Error('QuickBooks did not return an invoice number' +
+            (res.j.qboInvoiceId ? ' (QBO invoice id ' + res.j.qboInvoiceId + ' WAS created — find its number in QB and enter it via "Skip")' : '') +
+            '. If "custom transaction numbers" is ON in QB settings, QB stops auto-assigning numbers.');
+        }
+        FVQ_S.docNumber = String(res.j.docNumber);
+        var who = res.j.customerName ? ' · booked under QBO customer “' + fvqEscHtml(res.j.customerName) + '”' + (res.j.customerCreated ? ' (new)' : '') : '';
+        st.innerHTML = '<span class="fvq-ok">' + (res.j.existing ? '✓ Found existing QB invoice' : '✓ Created in QuickBooks') +
+          ':</span> <span class="fvq-big">#' + fvqEscHtml(FVQ_S.docNumber) + '</span>' + who +
+          '<br><span class="fvq-spin"></span> Writing QB number back to SharePoint…';
+        return fvqPatchInvoice(r.Id, { QB_Invoice_Number: FVQ_S.docNumber }).then(function(){
+          r.QB_Invoice_Number = FVQ_S.docNumber;
+          fvqLogRun({ action:'Invoice Desk — QB sync', jobNumber:r.Job_Number, result:'Success',
+            details:{ invoice:r.Title, qbNumber:FVQ_S.docNumber, qboInvoiceId:res.j.qboInvoiceId, existing:res.j.existing, customer:res.j.customerName } });
+          st.innerHTML = '<span class="fvq-ok">✓ QB invoice <b>#' + fvqEscHtml(FVQ_S.docNumber) + '</b>' + who + ' — number saved to the invoice record.</span>';
+          setTimeout(function(){ FVQ_S.step = 3; fvqRender(); }, 900);
+        });
+      })
+      .catch(function(e){
+        if (e && e.fvqAbort) return;
+        setBusy(false);
+        fvqLogRun({ action:'Invoice Desk — QB sync', jobNumber:r.Job_Number, result:'Failed', details:{ invoice:r.Title, error: e.message } });
+        st.innerHTML = '<span class="fvq-err">✗ ' + fvqEscHtml(e.message) + '</span><div class="fvq-hint">You can retry, or use "Skip" and enter the QB number manually.</div>';
+      });
+  };
+}
+
+function fvqStep3(){
+  var r = FVQ_S.row, b = fvqEl('fvq-body');
+  b.innerHTML =
+    '<div class="fvq-card">Stamping QB invoice number <span class="fvq-big">#' + fvqEscHtml(FVQ_S.docNumber || '?') + '</span> into the PDF, then <b>flattening</b> it (uneditable). The original file is never modified — a stamped copy is saved next to it.</div>' +
+    '<div class="fvq-row"><label>PDF source</label><div class="fvq-list" id="fvq-pdfs">Looking in the job folder’s ' + fvqEscHtml(FVQ_CFG.JOB_INVOICE_SUBFOLDER) + '…</div>' +
+    '<div class="fvq-hint">…or pick a local file: <input type="file" id="fvq-file" accept="application/pdf"></div></div>' +
+    '<div class="fvq-actions"><button class="fvq-btn ghost" id="fvq-back">← Back</button>' +
+    '<button class="fvq-btn ghost" id="fvq-skip3">Skip stamping → Email</button></div>' +
+    '<div class="fvq-status" id="fvq-st"></div>';
+  fvqEl('fvq-back').onclick = function(){ FVQ_S.step = 2; fvqRender(); };
+  fvqEl('fvq-skip3').onclick = function(){ FVQ_S.step = 4; fvqRender(); };
+  fvqEl('fvq-file').onchange = function(){
+    var f = this.files[0]; if (!f) return;
+    f.arrayBuffer().then(function(buf){ fvqDoStamp(buf, f.name, null); });
+  };
+  fvqFindJobFolder(r.Job_Number).then(function(folder){
+    FVQ_S.jobFolder = folder;
+    if (!folder){ fvqEl('fvq-pdfs').innerHTML = '<div style="padding:10px;color:#5a6b7e">No job folder found for ' + fvqEscHtml(r.Job_Number || '(no job number)') + ' — use a local file.</div>'; return; }
+    var invFolder = folder.ServerRelativeUrl + '/' + FVQ_CFG.JOB_INVOICE_SUBFOLDER;
+    return fvqListPdfs(invFolder).then(function(pdfs){
+      var el = fvqEl('fvq-pdfs');
+      if (!el) return; // user already moved to another step
+      el.innerHTML = pdfs.length ? '' : '<div style="padding:10px;color:#5a6b7e">No PDFs in ' + fvqEscHtml(FVQ_CFG.JOB_INVOICE_SUBFOLDER) + ' yet — use a local file.</div>';
+      pdfs.forEach(function(p){
+        var d = document.createElement('div');
+        d.textContent = p.Name;
+        d.onclick = function(){
+          fvqEl('fvq-st').innerHTML = '<span class="fvq-spin"></span> Downloading ' + fvqEscHtml(p.Name) + '…';
+          fvqDownload(FVQ_CFG.JOBS_SITE, p.ServerRelativeUrl)
+            .then(function(buf){ fvqDoStamp(buf, p.Name, invFolder); })
+            .catch(function(e){ fvqEl('fvq-st').innerHTML = '<span class="fvq-err">' + fvqEscHtml(e.message) + '</span>'; });
+        };
+        el.appendChild(d);
+      });
+    });
+  }).catch(function(e){
+    var el = fvqEl('fvq-pdfs');
+    if (el) el.innerHTML = '<div class="fvq-err" style="padding:10px">' + fvqEscHtml(e.message) + ' — use a local file instead.</div>';
+  });
+}
+function fvqDoStamp(buf, name, invFolderRelOrNull){
+  var st = fvqEl('fvq-st');
+  if (!FVQ_S.docNumber){ st.innerHTML = '<span class="fvq-err">No QB number yet — go back to step 2.</span>'; return; }
+  st.innerHTML = '<span class="fvq-spin"></span> Stamping & flattening…';
+  fvqStampPdf(buf, FVQ_S.docNumber).then(function(res){
+    FVQ_S.stamped = res.bytes;
+    FVQ_S.stampedName = FVQ_L.stampName(name, FVQ_S.docNumber);
+    var blob = new Blob([res.bytes], { type:'application/pdf' });
+    var url = URL.createObjectURL(blob);
+    var how = res.method.indexOf('form:') === 0 ? 'filled form field "' + res.method.slice(5) + '" and flattened' : 'text stamp added';
+    st.innerHTML = '<span class="fvq-ok">✓ Stamped (' + fvqEscHtml(how) + ').</span> ' +
+      '<a href="' + url + '" download="' + fvqEscHtml(FVQ_S.stampedName) + '">Download ' + fvqEscHtml(FVQ_S.stampedName) + '</a>' +
+      '<div class="fvq-actions">' +
+      (invFolderRelOrNull ? '<button class="fvq-btn ghost" id="fvq-up">Save copy to ' + fvqEscHtml(FVQ_CFG.JOB_INVOICE_SUBFOLDER) + '</button>' : '') +
+      '<button class="fvq-btn primary" id="fvq-next3">Continue → Email draft</button></div>';
+    if (invFolderRelOrNull){
+      fvqEl('fvq-up').onclick = function(){
+        var self = this; self.disabled = true; self.textContent = 'Saving…';
+        fvqUpload(FVQ_CFG.JOBS_SITE, invFolderRelOrNull, FVQ_S.stampedName, FVQ_S.stamped).then(function(res2){
+          self.textContent = res2.existed ? 'Already saved (kept existing)' : '✓ Saved to ' + FVQ_CFG.JOB_INVOICE_SUBFOLDER;
+          fvqLogRun({ action:'Invoice Desk — stamped PDF saved', jobNumber:(FVQ_S.row || {}).Job_Number, result: res2.existed ? 'Skipped (existed)' : 'Success',
+            details:{ file: FVQ_S.stampedName, folder: invFolderRelOrNull } });
+        }).catch(function(e){ self.disabled = false; self.textContent = 'Retry save'; alert(e.message); });
+      };
+    }
+    fvqEl('fvq-next3').onclick = function(){ FVQ_S.step = 4; fvqRender(); };
+  }).catch(function(e){ st.innerHTML = '<span class="fvq-err">✗ ' + fvqEscHtml(e.message) + '</span>'; });
+}
+
+function fvqStep4(){
+  var r = FVQ_S.row, b = fvqEl('fvq-body');
+  var email = FVQ_L.buildEmail({
+    docNumber: FVQ_S.docNumber || r.QB_Invoice_Number || '',
+    jobNumber: r.Job_Number, clientName: r.Client_Name,
+    address: r.Property_Address, total: r.Total, dueDate: (r.Due_Date || '').slice(0, 10)
+  });
+  b.innerHTML =
+    '<div class="fvq-card">Creates a <b>DRAFT in your Outlook</b> — you review and press Send there. Nothing is sent automatically.' +
+    (FVQ_S.stamped ? '<br>Attachment: <b>' + fvqEscHtml(FVQ_S.stampedName) + '</b>' : '<br><span class="fvq-warn">⚠ No stamped PDF from step 3 — the draft will have no attachment (you can attach in Outlook).</span>') + '</div>' +
+    '<div class="fvq-row"><label>To</label><input type="email" id="fvq-to" value="' + fvqEscHtml(FVQ_S.clientEmail) + '" placeholder="client@example.com"></div>' +
+    '<div class="fvq-row"><label>Subject</label><input type="text" id="fvq-subj" value="' + fvqEscHtml(email.subject) + '"></div>' +
+    '<div class="fvq-row"><label>Add a personal note (optional, inserted before the payment info)</label><textarea id="fvq-note" placeholder="e.g. It was great seeing you on site Tuesday…"></textarea></div>' +
+    '<div class="fvq-actions"><button class="fvq-btn ghost" id="fvq-back">← Back</button>' +
+    '<button class="fvq-btn primary" id="fvq-draft">Create Outlook draft</button></div>' +
+    '<div class="fvq-status" id="fvq-st"></div>';
+  fvqEl('fvq-back').onclick = function(){ FVQ_S.step = 3; fvqRender(); };
+
+  function fvqCreateDraft(token){
+    var st = fvqEl('fvq-st');
+    st.innerHTML = '<span class="fvq-spin"></span> Creating draft…';
+    var mail = FVQ_L.buildEmail({
+      docNumber: FVQ_S.docNumber || r.QB_Invoice_Number || '',
+      jobNumber: r.Job_Number, clientName: r.Client_Name, address: r.Property_Address,
+      total: r.Total, dueDate: (r.Due_Date || '').slice(0, 10),
+      extraNote: fvqEl('fvq-note').value.trim()
+    });
+    var msg = {
+      subject: fvqEl('fvq-subj').value,
+      body: { contentType: 'HTML', content: mail.html },
+      toRecipients: fvqEl('fvq-to').value ? [{ emailAddress: { address: fvqEl('fvq-to').value.trim() } }] : []
+    };
+    var attachNote = '';
+    if (FVQ_S.stamped){
+      // Graph inline attachments cap the whole request at ~4 MB (base64 adds ~33%)
+      if (FVQ_S.stamped.byteLength > 2500000){
+        attachNote = '<div class="fvq-hint">⚠ The stamped PDF is ' + (FVQ_S.stamped.byteLength / 1048576).toFixed(1) +
+          ' MB — too large to attach automatically. The draft was created without it; attach the file in Outlook (you downloaded it / saved it to ' + fvqEscHtml(FVQ_CFG.JOB_INVOICE_SUBFOLDER) + ').</div>';
+      } else {
+        var bin = ''; var u8 = new Uint8Array(FVQ_S.stamped);
+        for (var i = 0; i < u8.length; i += 0x8000){ bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); }
+        msg.attachments = [{ '@odata.type': '#microsoft.graph.fileAttachment', name: FVQ_S.stampedName, contentType: 'application/pdf', contentBytes: btoa(bin) }];
+      }
+    }
+    fetch('https://graph.microsoft.com/v1.0/me/messages', {
+      method:'POST', headers:{ Authorization:'Bearer ' + token, 'Content-Type':'application/json' }, body: JSON.stringify(msg)
+    }).then(function(resp){
+      if (!resp.ok) return resp.text().then(function(t){ throw new Error('Graph ' + resp.status + ': ' + t.slice(0, 200)); });
+      return resp.json();
+    }).then(function(j){
+      fvqLogRun({ action:'Invoice Desk — Outlook draft created', jobNumber:r.Job_Number, result:'Success',
+        details:{ invoice:r.Title, qbNumber: FVQ_S.docNumber || r.QB_Invoice_Number, attached: !!msg.attachments } });
+      st.innerHTML = '<span class="fvq-ok">✅ Draft created.</span> ' +
+        (j.webLink ? '<a href="' + j.webLink + '" target="_blank" rel="noopener">Open it in Outlook to review & send →</a>' : 'Open your Outlook Drafts folder to review & send.') + attachNote;
+    }).catch(function(e){ st.innerHTML = '<span class="fvq-err">✗ ' + fvqEscHtml(e.message) + '</span>' +
+      '<div class="fvq-hint">If this is a consent error, the Azure app needs the delegated <b>Mail.ReadWrite</b> permission — see INTEGRATION.md.</div>'; });
+  }
+
+  fvqEl('fvq-draft').onclick = function(){
+    var st = fvqEl('fvq-st');
+    st.innerHTML = '<span class="fvq-spin"></span> Checking Microsoft sign-in…';
+    fvqTokenSilent().then(fvqCreateDraft).catch(function(e){
+      if (!(e && e.needsInteraction)){
+        st.innerHTML = '<span class="fvq-err">✗ ' + fvqEscHtml(e.message || String(e)) + '</span>'; return;
+      }
+      // Interactive consent needed — the popup must open synchronously inside
+      // a click handler or iOS Safari blocks it, hence this dedicated button.
+      st.innerHTML = '<div class="fvq-hint">One-time Microsoft sign-in is needed to create drafts.</div>' +
+        '<div class="fvq-actions"><button class="fvq-btn primary" id="fvq-signin">Sign in with Microsoft</button></div>';
+      fvqEl('fvq-signin').onclick = function(){
+        var app = FVQ_msalApp;
+        if (!app){ st.innerHTML = '<span class="fvq-err">Sign-in library not loaded — check your connection, close and reopen the desk.</span>'; return; }
+        var req = { scopes: FVQ_CFG.GRAPH_SCOPES };
+        var acct = app.getAllAccounts()[0];
+        var p = acct ? app.acquireTokenPopup(Object.assign({ account: acct }, req)) : app.loginPopup(req);
+        p.then(function(res){
+          if (res && res.accessToken) return res.accessToken;
+          var a2 = app.getAllAccounts()[0];
+          return app.acquireTokenSilent(Object.assign({ account: a2 }, req)).then(function(x){ return x.accessToken; });
+        }).then(fvqCreateDraft).catch(function(err){
+          st.innerHTML = '<span class="fvq-err">✗ ' + fvqEscHtml(err.message || String(err)) + '</span>' +
+            '<div class="fvq-hint">If a popup was blocked, allow popups for this site and tap again. If this is a consent error, the Azure app needs delegated <b>Mail.ReadWrite</b> — see INTEGRATION.md.</div>';
+        });
+      };
+    });
+  };
+}
+
+/* ── BOOT ─────────────────────────────────────────────────────────────────── */
+window.FVInvoiceQB = { open: fvqOpen, close: fvqClose, _logic: FVQ_L, _cfg: FVQ_CFG };
+function fvqBoot(){
+  var fab = fvqEl('fvq-fab');
+  if (!fab) return;
+  fab.onclick = fvqOpen;
+  fvqEl('fvq-close').onclick = fvqClose;
+  fvqEl('fvq-overlay').onclick = fvqClose;
+}
+if (typeof document !== 'undefined' && document.readyState !== 'loading') fvqBoot();
+else if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', fvqBoot);
+})();
+</script>
+<!-- ══════ FORTIVO INVOICE → QUICKBOOKS DESK — END ══════ -->

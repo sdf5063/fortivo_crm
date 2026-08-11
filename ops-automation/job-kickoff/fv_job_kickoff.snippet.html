@@ -1,0 +1,633 @@
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     FORTIVO JOB KICKOFF (FVK) — self-contained drop-in block
+     ───────────────────────────────────────────────────────────────────────────
+     Paste this ENTIRE block into fortivo_app.html directly BEFORE </body>
+     (same pattern as the universal search bar block). No other changes needed.
+
+     What it does (one tap):
+       1. Creates the job folder in  01_Active Jobs/01_Job Name/  named per the
+          Fortivo convention:  {job number} ({client}-{type})
+       2. Reads the LIVE manifest of "01_Template Job Folder" and creates every
+          subfolder (incl. one nested level, e.g. 08_Invoices/T&M) that is
+          missing — so folders you add to the template later are picked up
+          automatically, and re-runs only ever fill gaps (race-safe: two
+          devices running kickoff concurrently cannot produce duplicates)
+       3. Seeds the right contract into 01_Contract as an editable .docx DRAFT:
+            - Mitigation  → Fortivo Emergency Work Authorization
+            - Mitigation + Healthcare property → Healthcare EWA
+            - Anything else → Fortivo Client Work Agreement
+            - DC property  → DC-specific CWA variant (auto-suggested)
+       4. Writes an audit entry to the Automation_Log list (best-effort)
+
+     DATA SAFETY GUARANTEES (create-only engine):
+       - NEVER deletes anything. NEVER overwrites anything. Every write is a
+         create with overwrite=false; conflicts are skipped and reported.
+       - If the job folder already exists, it switches to VERIFY/REPAIR mode:
+         it only adds missing template subfolders and reports what it found.
+       - Dry-run toggle shows the exact plan without touching SharePoint.
+
+     Optional deeper integration (see INTEGRATION.md):
+       window.FVKickoff.open({jobNumber, clientName, jobType, propertyType, state})
+     ═══════════════════════════════════════════════════════════════════════ -->
+<style>
+  #fvk-fab{position:fixed;right:18px;bottom:84px;z-index:99990;background:#19345E;color:#fff;
+    border:2px solid #1292D1;border-radius:26px;padding:12px 18px;font-size:15px;font-weight:600;
+    cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);display:flex;align-items:center;gap:8px}
+  #fvk-fab:hover{background:#1292D1}
+  #fvk-overlay{position:fixed;inset:0;background:rgba(10,20,40,.55);z-index:99998;display:none}
+  #fvk-modal{position:fixed;z-index:99999;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:min(680px,94vw);max-height:88vh;overflow:auto;background:#fff;border-radius:12px;
+    box-shadow:0 12px 40px rgba(0,0,0,.45);display:none;font-family:inherit;color:#1c2b3a;
+    -webkit-overflow-scrolling:touch}
+  .fvk-head{background:#19345E;color:#fff;padding:14px 18px;border-radius:12px 12px 0 0;
+    display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:2}
+  .fvk-head h3{margin:0;font-size:17px}
+  .fvk-x{background:none;border:none;color:#fff;font-size:22px;cursor:pointer;line-height:1;min-width:44px;min-height:44px}
+  .fvk-body{padding:16px 18px 22px}
+  .fvk-row{margin-bottom:14px}
+  .fvk-row label{display:block;font-size:12px;font-weight:700;color:#19345E;text-transform:uppercase;
+    letter-spacing:.4px;margin-bottom:4px}
+  .fvk-row input[type=text],.fvk-row select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #c6d2e0;
+    border-radius:8px;font-size:15px;background:#fff;color:#1c2b3a}
+  .fvk-row input:focus,.fvk-row select:focus{outline:2px solid #1292D1}
+  .fvk-hint{font-size:12px;color:#5a6b7e;margin-top:3px}
+  .fvk-badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:700}
+  .fvk-badge.create{background:#e2f2e5;color:#1c7a34}
+  .fvk-badge.repair{background:#fdf1d7;color:#8a6100}
+  .fvk-plan{background:#f4f7fb;border:1px solid #dbe4ef;border-radius:8px;padding:10px 12px;font-size:13px;
+    max-height:220px;overflow:auto}
+  .fvk-plan li{margin:3px 0}
+  .fvk-plan .fvk-ok{color:#1c7a34}
+  .fvk-plan .fvk-new{color:#19345E;font-weight:600}
+  .fvk-plan .fvk-skip{color:#8a6100}
+  .fvk-actions{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;align-items:center}
+  .fvk-btn{border:none;border-radius:8px;padding:12px 20px;font-size:15px;font-weight:700;cursor:pointer;min-height:44px}
+  .fvk-btn.primary{background:#1292D1;color:#fff}
+  .fvk-btn.primary:disabled{background:#9db8c9;cursor:not-allowed}
+  .fvk-btn.ghost{background:#eef2f7;color:#19345E}
+  .fvk-drh{display:flex;align-items:center;gap:6px;font-size:13px;color:#5a6b7e;margin-left:auto}
+  .fvk-status{margin-top:14px;font-size:14px}
+  .fvk-status .fvk-step{display:flex;gap:8px;align-items:flex-start;margin:5px 0}
+  .fvk-spin{display:inline-block;width:14px;height:14px;border:2px solid #1292D1;border-top-color:transparent;
+    border-radius:50%;animation:fvkspin .8s linear infinite;margin-top:2px}
+  @keyframes fvkspin{to{transform:rotate(360deg)}}
+  .fvk-done{color:#1c7a34;font-weight:700}
+  .fvk-warn{color:#8a6100;font-weight:700}
+  .fvk-err{color:#b3261e;font-weight:700}
+  .fvk-result a{color:#1292D1;font-weight:700;word-break:break-all}
+  .fvk-joblist{max-height:200px;overflow:auto;border:1px solid #dbe4ef;border-radius:8px;margin-top:6px}
+  .fvk-joblist div{padding:9px 12px;border-bottom:1px solid #eef2f7;cursor:pointer;font-size:14px;min-height:26px}
+  .fvk-joblist div:hover{background:#eaf4fb}
+  @media (max-width:640px){ #fvk-fab{bottom:96px;right:12px} .fvk-body{padding:12px 12px 18px} }
+</style>
+
+<button id="fvk-fab" type="button" title="Set up job folder from template">⚡ Job Kickoff</button>
+<div id="fvk-overlay"></div>
+<div id="fvk-modal" role="dialog" aria-modal="true" aria-label="Job Kickoff">
+  <div class="fvk-head"><h3>⚡ Job Kickoff — Folder &amp; Contract Setup</h3>
+    <button class="fvk-x" id="fvk-close" aria-label="Close">×</button></div>
+  <div class="fvk-body" id="fvk-body"><!-- rendered by JS --></div>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ── CONFIG — single place to adjust paths, naming, and rules ─────────────── */
+var FVK_CFG = {
+  HOST: (typeof location !== 'undefined' && location.origin) || 'https://fortivopropertyservices.sharepoint.com',
+  OPS_SITE:  '/sites/FortivoOperations',            // where the app + lists live
+  JOBS_SITE: '/sites/ActiveJobs',                   // where job folders live
+  ACTIVE_ROOT: '/sites/ActiveJobs/Shared Documents/01_Active Jobs/01_Job Name',
+  TEMPLATE_FOLDER: '/sites/ActiveJobs/Shared Documents/01_Active Jobs/01_Job Name/01_Template Job Folder',
+  CONTRACT_SUBFOLDER: '01_Contract',
+  JOBS_LIST: 'Jobs_Master',
+  LOG_LIST: 'Automation_Log',                       // best-effort audit log (see INTEGRATION.md)
+  NAME_PATTERN: '{num} ({client}-{type})',          // observed convention: 26-02-00051 (Sherman-Recon)
+  JOB_TYPES: ['Mitigation','Repair','Reconstruction','Contents','Other'],
+  TYPE_SHORT: { Mitigation:'Mit', Repair:'Repair', Reconstruction:'Recon', Contents:'Contents', Other:'' },
+  // job number = YY-PP-NNNNN; PP segment hints the type (verify/extend as you add codes)
+  TYPE_SEGMENT_MAP: { '01':'Mitigation', '02':'Repair' },
+  ACTIVE_STATUSES: ['Open','In Progress','On Hold'],
+  // Candidate column names, first match wins — resilient to naming drift in Jobs_Master
+  FIELDS: {
+    jobNumber:    ['Job_Number','JobNumber','Title'],
+    clientName:   ['Client_Name','Client','Account_Name'],
+    status:       ['Status','Job_Status'],
+    propertyType: ['Property_Type','Client_Category'],
+    state:        ['State','Property_State','Job_State']
+  },
+  CONTRACTS: [
+    { id:'ewa',            label:'Emergency Work Authorization (EWA)',
+      src:'/sites/Fortivo/Shared Documents/11_Templates/01_Client-Facing/02_Project Specific/Final/Fortivo Emergency Work Authorization.docx' },
+    { id:'ewa-healthcare', label:'Healthcare Emergency Work Authorization',
+      src:'/sites/Fortivo/Shared Documents/11_Templates/07_Healthcare/01_Contracts/Fortivo_Healthcare_Emergency_Work_Authorization.docx' },
+    { id:'cwa',            label:'Client Work Agreement (CWA)',
+      src:'/sites/Fortivo/Shared Documents/11_Templates/01_Client-Facing/02_Project Specific/Final/Fortivo Client Work Agreement.docx' },
+    { id:'cwa-dc-hi',      label:'CWA — DC Home Improvement',
+      src:'/sites/Fortivo/Shared Documents/11_Templates/01_Client-Facing/02_Project Specific/Final/Fortivo Client Work Agreement (DC Home Improvement Only).docx' },
+    { id:'cwa-dc-gc',      label:'CWA — DC General Construction',
+      src:'/sites/Fortivo/Shared Documents/11_Templates/01_Client-Facing/02_Project Specific/Final/Fortivo Client Work Agreement (DC General Construction Only).docx' },
+    { id:'none',           label:'No contract (folders only)', src:null }
+  ]
+};
+
+/* ── PURE LOGIC (exposed as FVKickoff._logic for the node test suite) ─────── */
+var FVK_L = {
+  // SharePoint-illegal / risky filename characters removed, whitespace collapsed
+  sanitizeName: function(s){
+    return String(s || '')
+      .replace(/["*:<>?\/\\|#%]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s.]+|[\s.]+$/g, '');
+  },
+  buildFolderName: function(job, pattern){
+    var type = FVK_CFG.TYPE_SHORT[job.jobType] !== undefined ? FVK_CFG.TYPE_SHORT[job.jobType] : (job.jobType || '');
+    var name = (pattern || FVK_CFG.NAME_PATTERN)
+      .replace('{num}', job.jobNumber || '')
+      .replace('{client}', job.clientName || '')
+      .replace('{type}', type);
+    // tidy artifacts when type/client is blank, e.g. "26-.. (Smith-)" → "26-.. (Smith)"
+    name = name.replace(/-\)/g, ')').replace(/\(\s*-/g, '(').replace(/\(\s*\)/g, '');
+    return FVK_L.sanitizeName(name);
+  },
+  inferTypeFromNumber: function(jobNumber){
+    var m = /^\d{2}-(\d{2})-/.exec(String(jobNumber || '').trim());
+    return (m && FVK_CFG.TYPE_SEGMENT_MAP[m[1]]) || '';
+  },
+  // Contract decision matrix — mirrors how Scott picks contracts by hand
+  pickContract: function(job){
+    var type = (job.jobType || '').toLowerCase();
+    var prop = (job.propertyType || '').toLowerCase();
+    var state = (job.state || '').toUpperCase().trim();
+    var isDC = state === 'DC' || state === 'DISTRICT OF COLUMBIA' || state === 'WASHINGTON DC';
+    if (type === 'mitigation') return prop === 'healthcare' ? 'ewa-healthcare' : 'ewa';
+    if (isDC) return prop === 'residential' ? 'cwa-dc-hi' : 'cwa-dc-gc';
+    return 'cwa';
+  },
+  // Which template subfolders are missing from an existing job folder
+  planMissing: function(templateNames, existingNames){
+    var have = {};
+    (existingNames || []).forEach(function(n){ have[String(n).toLowerCase()] = true; });
+    return (templateNames || []).filter(function(n){ return !have[String(n).toLowerCase()]; });
+  },
+  draftContractName: function(templateSrcPath, jobNumber){
+    var base = String(templateSrcPath || '').split('/').pop() || 'Contract.docx';
+    var dot = base.lastIndexOf('.');
+    var stem = dot > 0 ? base.slice(0, dot) : base, ext = dot > 0 ? base.slice(dot) : '';
+    return FVK_L.sanitizeName(stem + ' - ' + (jobNumber || '') + ' - DRAFT') + ext;
+  },
+  // Map a raw SP item to a job object using the first candidate column that exists
+  mapJob: function(item){
+    function pick(cands){
+      for (var i = 0; i < cands.length; i++){
+        var v = item[cands[i]];
+        if (v !== undefined && v !== null && v !== '') return v;
+      }
+      return '';
+    }
+    return {
+      spId: item.Id || item.ID || null,
+      jobNumber:    pick(FVK_CFG.FIELDS.jobNumber),
+      clientName:   pick(FVK_CFG.FIELDS.clientName),
+      status:       pick(FVK_CFG.FIELDS.status),
+      propertyType: pick(FVK_CFG.FIELDS.propertyType),
+      state:        pick(FVK_CFG.FIELDS.state)
+    };
+  },
+  isActiveStatus: function(status){
+    if (!status) return true; // unknown status column → don't filter anything out
+    return FVK_CFG.ACTIVE_STATUSES.some(function(s){ return s.toLowerCase() === String(status).toLowerCase(); });
+  }
+};
+
+/* ── SHAREPOINT REST HELPERS (same-origin; cookies do the auth) ───────────── */
+var FVK_digests = {}; // per-site {value, exp}
+function fvkEsc(p){ return encodeURIComponent(String(p).replace(/'/g, "''")); }
+function fvkDigest(site){
+  var d = FVK_digests[site];
+  if (d && d.exp > Date.now()) return Promise.resolve(d.value);
+  return fetch(FVK_CFG.HOST + site + '/_api/contextinfo', {
+    method:'POST', headers:{ Accept:'application/json;odata=nometadata' }, credentials:'same-origin'
+  }).then(function(r){
+    if (!r.ok) throw new Error('contextinfo ' + r.status + ' on ' + site);
+    return r.json();
+  }).then(function(j){
+    var v = j.FormDigestValue || (j.d && j.d.GetContextWebInformation && j.d.GetContextWebInformation.FormDigestValue);
+    FVK_digests[site] = { value:v, exp: Date.now() + 20*60*1000 };
+    return v;
+  });
+}
+function fvkGet(site, apiPath){
+  return fetch(FVK_CFG.HOST + site + '/_api/' + apiPath, {
+    headers:{ Accept:'application/json;odata=nometadata' }, credentials:'same-origin'
+  });
+}
+function fvkPost(site, apiPath, opts){
+  opts = opts || {};
+  return fvkDigest(site).then(function(dig){
+    var headers = Object.assign({
+      Accept:'application/json;odata=verbose', 'X-RequestDigest':dig
+    }, opts.headers || {});
+    return fetch(FVK_CFG.HOST + site + '/_api/' + apiPath, {
+      method:'POST', headers:headers, credentials:'same-origin', body: opts.body
+    });
+  });
+}
+function fvkFolderExists(site, serverRelPath){
+  return fvkGet(site, "web/GetFolderByServerRelativePath(DecodedUrl=@f)?@f='" + fvkEsc(serverRelPath) + "'&$select=Exists")
+    .then(function(r){
+      if (r.status === 404) return false;
+      if (!r.ok) return r.text().then(function(t){ throw new Error('folder check ' + r.status + ': ' + t.slice(0,200)); });
+      return r.json().then(function(j){ return j.Exists !== false; });
+    });
+}
+function fvkListSubfolders(site, serverRelPath){
+  return fvkGet(site, "web/GetFolderByServerRelativePath(DecodedUrl=@f)/Folders?@f='" + fvkEsc(serverRelPath) + "'&$select=Name,ServerRelativeUrl&$top=500&$orderby=Name")
+    .then(function(r){
+      if (!r.ok) return r.text().then(function(t){ throw new Error('list folders ' + r.status + ': ' + t.slice(0,200)); });
+      return r.json();
+    }).then(function(j){
+      return (j.value || []).filter(function(f){ return f.Name !== 'Forms'; });
+    });
+}
+function fvkListFiles(site, serverRelPath){
+  return fvkGet(site, "web/GetFolderByServerRelativePath(DecodedUrl=@f)/Files?@f='" + fvkEsc(serverRelPath) + "'&$select=Name&$top=500")
+    .then(function(r){ return r.ok ? r.json() : { value: [] }; })
+    .then(function(j){ return (j.value || []).map(function(f){ return f.Name; }); });
+}
+// Create-only. Note: SP Online treats folder AddUsingPath as idempotent — an
+// existing folder returns 200 with the folder object, nothing is modified.
+// Callers diff against the live manifest first, so this only runs for folders
+// believed missing; the error regex below is a defensive fallback only.
+function fvkCreateFolder(site, serverRelPath){
+  return fvkPost(site, "web/folders/AddUsingPath(DecodedUrl=@f)?@f='" + fvkEsc(serverRelPath) + "'")
+    .then(function(r){
+      if (r.ok) return { created:true };
+      return r.text().then(function(t){
+        if (/already exists|SPDuplicateValues|-2130245363/i.test(t)) return { created:false, existed:true };
+        throw new Error('create folder ' + r.status + ': ' + t.slice(0,200));
+      });
+    });
+}
+// Cross-site file copy = download bytes from source site, create-only upload to destination
+function fvkCopyFileCrossSite(srcSite, srcServerRelFile, destSite, destFolderServerRel, newName){
+  return fvkGet(srcSite, "web/GetFileByServerRelativePath(DecodedUrl=@f)/$value?@f='" + fvkEsc(srcServerRelFile) + "'")
+    .then(function(r){
+      if (!r.ok) throw new Error('template download ' + r.status + ' — check path: ' + srcServerRelFile);
+      return r.arrayBuffer();
+    })
+    .then(function(buf){
+      return fvkPost(destSite,
+        "web/GetFolderByServerRelativePath(DecodedUrl=@f)/Files/AddUsingPath(DecodedUrl=@n,overwrite=@o)?@f='" +
+        fvkEsc(destFolderServerRel) + "'&@n='" + fvkEsc(newName) + "'&@o=false",
+        { headers:{ 'Content-Type':'application/octet-stream' }, body: buf });
+    })
+    .then(function(r){
+      if (r.ok) return { uploaded:true };
+      return r.text().then(function(t){
+        if (/already exists|SPDuplicateValues|-2130575257/i.test(t)) return { uploaded:false, existed:true };
+        throw new Error('contract upload ' + r.status + ': ' + t.slice(0,200));
+      });
+    });
+}
+function fvkLogRun(entry){ // best-effort audit; never blocks or throws
+  var body = JSON.stringify({
+    __metadata:{ type:'SP.Data.Automation_x005f_LogListItem' },
+    Title: entry.action || 'Job Kickoff',
+    Job_Number: entry.jobNumber || '',
+    Result: entry.result || '',
+    Details: JSON.stringify(entry.details || {}).slice(0, 60000)
+  });
+  return fvkPost(FVK_CFG.OPS_SITE, "web/lists/getbytitle('" + FVK_CFG.LOG_LIST + "')/items", {
+    headers:{ 'Content-Type':'application/json;odata=verbose' }, body: body
+  }).catch(function(){ /* list may not exist yet — fine */ });
+}
+
+/* ── DATA LOADERS ─────────────────────────────────────────────────────────── */
+function fvkLoadJobs(){
+  return fvkGet(FVK_CFG.OPS_SITE, "web/lists/getbytitle('" + FVK_CFG.JOBS_LIST + "')/items?$orderby=Id desc&$top=300")
+    .then(function(r){
+      if (!r.ok) throw new Error('Jobs_Master read failed (' + r.status + ')');
+      return r.json();
+    })
+    .then(function(j){
+      return (j.value || []).map(FVK_L.mapJob)
+        .filter(function(job){ return job.jobNumber && FVK_L.isActiveStatus(job.status); });
+    });
+}
+function fvkFindExistingJobFolder(jobNumber){
+  var prefix = String(jobNumber || '').trim().toLowerCase();
+  // Empty prefix would match EVERY folder (''.indexOf('') === 0) — including
+  // the template folder itself. Never match on an empty job number.
+  if (!prefix) return Promise.resolve(null);
+  var templateName = (FVK_CFG.TEMPLATE_FOLDER.split('/').pop() || '').toLowerCase();
+  return fvkListSubfolders(FVK_CFG.JOBS_SITE, FVK_CFG.ACTIVE_ROOT).then(function(folders){
+    var hit = folders.find(function(f){
+      var n = f.Name.toLowerCase();
+      return n !== templateName && n.indexOf(prefix) === 0;
+    });
+    return hit || null;
+  });
+}
+
+/* ── UI ───────────────────────────────────────────────────────────────────── */
+var FVK_state = { jobs:[], job:null, existing:null, templateFolders:[], busy:false };
+
+function fvkEl(id){ return document.getElementById(id); }
+function fvkEscHtml(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+  return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]; }); }
+
+function fvkOpen(prefill){
+  fvkEl('fvk-overlay').style.display = 'block';
+  fvkEl('fvk-modal').style.display = 'block';
+  fvkRenderPicker(prefill || null);
+}
+function fvkClose(){
+  fvkEl('fvk-overlay').style.display = 'none';
+  fvkEl('fvk-modal').style.display = 'none';
+  FVK_state.job = null; FVK_state.existing = null; FVK_state.busy = false;
+}
+
+function fvkRenderPicker(prefill){
+  var b = fvkEl('fvk-body');
+  b.innerHTML =
+    '<div class="fvk-row"><label>Job</label>' +
+    '<input type="text" id="fvk-search" placeholder="Search by job number or client…" autocomplete="off">' +
+    '<div class="fvk-joblist" id="fvk-joblist"><div style="color:#5a6b7e">Loading active jobs…</div></div>' +
+    '<div class="fvk-hint">Or start from a job that isn’t saved yet: <a href="#" id="fvk-manual">enter details manually</a></div></div>';
+  fvkEl('fvk-manual').onclick = function(e){ e.preventDefault(); fvkRenderForm({ jobNumber:'', clientName:'', manual:true }); };
+  if (prefill && prefill.manual){ fvkRenderForm({ jobNumber: prefill.jobNumber || '', clientName: prefill.clientName || '', manual:true }); return; }
+  if (prefill && prefill.jobNumber){ fvkRenderForm(prefill); return; }
+  fvkLoadJobs().then(function(jobs){
+    FVK_state.jobs = jobs;
+    fvkDrawJobList(jobs);
+    fvkEl('fvk-search').oninput = function(){
+      var q = this.value.toLowerCase();
+      fvkDrawJobList(jobs.filter(function(j){
+        return (j.jobNumber + ' ' + j.clientName).toLowerCase().indexOf(q) !== -1;
+      }));
+    };
+  }).catch(function(err){
+    fvkEl('fvk-joblist').innerHTML = '<div class="fvk-err" style="padding:10px">' + fvkEscHtml(err.message) +
+      ' — you can still <a href="#" onclick="FVKickoff.open({manual:true});return false">enter details manually</a>.</div>';
+  });
+}
+function fvkDrawJobList(jobs){
+  var el = fvkEl('fvk-joblist');
+  if (!el) return;
+  el.innerHTML = jobs.length ? '' : '<div style="color:#5a6b7e">No matching active jobs</div>';
+  jobs.slice(0, 40).forEach(function(j){
+    var d = document.createElement('div');
+    d.textContent = j.jobNumber + ' — ' + (j.clientName || '(no client)') + (j.status ? '  [' + j.status + ']' : '');
+    d.onclick = function(){ fvkRenderForm(j); };
+    el.appendChild(d);
+  });
+}
+
+function fvkRenderForm(job){
+  job.jobType = job.jobType || FVK_L.inferTypeFromNumber(job.jobNumber) || 'Mitigation';
+  FVK_state.job = job;
+  var contractId = FVK_L.pickContract(job);
+  var name = FVK_L.buildFolderName(job);
+  var b = fvkEl('fvk-body');
+  b.innerHTML =
+    '<div class="fvk-row"><label>Job number</label><input type="text" id="fvk-num" value="' + fvkEscHtml(job.jobNumber) + '"' + (job.manual ? '' : ' readonly') + '></div>' +
+    '<div class="fvk-row"><label>Client name</label><input type="text" id="fvk-client" value="' + fvkEscHtml(job.clientName) + '"></div>' +
+    '<div class="fvk-row"><label>Job type</label><select id="fvk-type">' +
+      FVK_CFG.JOB_TYPES.map(function(t){ return '<option' + (t === job.jobType ? ' selected' : '') + '>' + t + '</option>'; }).join('') +
+    '</select><div class="fvk-hint">Guessed from the job number segment (' + fvkEscHtml(job.jobNumber.split('-')[1] || '?') + ') — change if wrong.</div></div>' +
+    '<div class="fvk-row"><label>Folder name (editable)</label><input type="text" id="fvk-name" value="' + fvkEscHtml(name) + '"></div>' +
+    '<div class="fvk-row"><label>Contract to seed into 01_Contract</label><select id="fvk-contract">' +
+      FVK_CFG.CONTRACTS.map(function(c){ return '<option value="' + c.id + '"' + (c.id === contractId ? ' selected' : '') + '>' + fvkEscHtml(c.label) + '</option>'; }).join('') +
+    '</select><div class="fvk-hint" id="fvk-contract-src"></div></div>' +
+    '<div class="fvk-row"><label>Plan</label><div class="fvk-plan" id="fvk-plan">Checking SharePoint…</div></div>' +
+    '<div class="fvk-actions">' +
+      '<button class="fvk-btn ghost" id="fvk-back">← Back</button>' +
+      '<button class="fvk-btn primary" id="fvk-go" disabled>Create</button>' +
+      '<label class="fvk-drh"><input type="checkbox" id="fvk-dry"> Dry run (show plan only)</label>' +
+    '</div>' +
+    '<div class="fvk-status" id="fvk-status"></div>';
+
+  function syncName(){
+    var j = fvkReadForm();
+    fvkEl('fvk-name').value = FVK_L.buildFolderName(j);
+  }
+  function syncContractHint(){
+    var c = FVK_CFG.CONTRACTS.find(function(x){ return x.id === fvkEl('fvk-contract').value; });
+    fvkEl('fvk-contract-src').textContent = c && c.src ? ('From: ' + c.src) : 'No contract will be copied.';
+  }
+  fvkEl('fvk-client').oninput = syncName;
+  // Manual mode: re-detect the existing-folder situation when the job number changes
+  var numTimer = null;
+  fvkEl('fvk-num').oninput = function(){
+    syncName();
+    clearTimeout(numTimer);
+    numTimer = setTimeout(fvkAnalyze, 600);
+  };
+  fvkEl('fvk-type').onchange = function(){ syncName(); var j = fvkReadForm(); fvkEl('fvk-contract').value = FVK_L.pickContract(j); syncContractHint(); };
+  fvkEl('fvk-contract').onchange = syncContractHint;
+  fvkEl('fvk-back').onclick = function(){ fvkRenderPicker(null); };
+  fvkEl('fvk-go').onclick = fvkExecute;
+  syncContractHint();
+  fvkAnalyze();
+}
+function fvkReadForm(){
+  var j = FVK_state.job || {};
+  return {
+    spId: j.spId || null,
+    jobNumber: fvkEl('fvk-num').value.trim(),
+    clientName: fvkEl('fvk-client').value.trim(),
+    jobType: fvkEl('fvk-type').value,
+    propertyType: j.propertyType || '',
+    state: j.state || '',
+    folderName: fvkEl('fvk-name').value.trim(),
+    contractId: fvkEl('fvk-contract').value,
+    dryRun: fvkEl('fvk-dry') ? fvkEl('fvk-dry').checked : false
+  };
+}
+function fvkAnalyze(){
+  var j = fvkReadForm();
+  var planEl = fvkEl('fvk-plan');
+  Promise.all([
+    fvkListSubfolders(FVK_CFG.JOBS_SITE, FVK_CFG.TEMPLATE_FOLDER),
+    fvkFindExistingJobFolder(j.jobNumber)
+  ]).then(function(res){
+    FVK_state.templateFolders = res[0].map(function(f){ return f.Name; });
+    FVK_state.existing = res[1];
+    var html = '';
+    if (FVK_state.existing){
+      html += '<div><span class="fvk-badge repair">FOLDER EXISTS</span> <b>' + fvkEscHtml(FVK_state.existing.Name) +
+              '</b> — switching to <b>verify &amp; repair</b>: only missing subfolders will be added. Nothing is ever overwritten.</div>';
+    } else {
+      html += '<div><span class="fvk-badge create">NEW</span> Will create <b>' + fvkEscHtml(j.folderName) +
+              '</b> in 01_Active Jobs/01_Job Name and copy the full template structure:</div>';
+    }
+    html += '<ul>' + FVK_state.templateFolders.map(function(n){ return '<li class="fvk-new">+ ' + fvkEscHtml(n) + '</li>'; }).join('') + '</ul>';
+    var c = FVK_CFG.CONTRACTS.find(function(x){ return x.id === j.contractId; });
+    if (c && c.src) html += '<div class="fvk-new">+ ' + fvkEscHtml(FVK_L.draftContractName(c.src, j.jobNumber)) + ' → ' + fvkEscHtml(FVK_CFG.CONTRACT_SUBFOLDER) + '</div>';
+    planEl.innerHTML = html;
+    var go = fvkEl('fvk-go');
+    go.disabled = false;
+    go.textContent = FVK_state.existing ? 'Verify & repair' : 'Create job folder';
+  }).catch(function(err){
+    planEl.innerHTML = '<span class="fvk-err">' + fvkEscHtml(err.message) + '</span>';
+  });
+}
+
+function fvkStep(html){ var s = fvkEl('fvk-status'); var d = document.createElement('div'); d.className = 'fvk-step'; d.innerHTML = html; s.appendChild(d); return d; }
+function fvkSetStep(el, html){ el.innerHTML = html; }
+
+function fvkExecute(){
+  if (FVK_state.busy) return;
+  var j = fvkReadForm();
+  if (!j.jobNumber){ alert('Job number is required'); return; }
+  if (!j.folderName){ alert('Folder name is required'); return; }
+  var contract = FVK_CFG.CONTRACTS.find(function(x){ return x.id === j.contractId; });
+  var details = { dryRun: j.dryRun, contract: contract && contract.src, steps: [] };
+  fvkEl('fvk-status').innerHTML = '';
+
+  if (j.dryRun){
+    fvkStep('<span class="fvk-warn">DRY RUN — nothing was written.</span> Plan: ' +
+      (FVK_state.existing ? 'verify/repair existing folder "' + fvkEscHtml(FVK_state.existing.Name) + '"' : 'create "' + fvkEscHtml(j.folderName) + '" + ' + FVK_state.templateFolders.length + ' subfolders') +
+      (contract && contract.src ? ' + seed contract "' + fvkEscHtml(FVK_L.draftContractName(contract.src, j.jobNumber)) + '"' : ''));
+    return;
+  }
+
+  FVK_state.busy = true;
+  fvkEl('fvk-go').disabled = true;
+  var destRel = null;
+
+  /* ── UNIFIED CREATE-ONLY FLOW ─────────────────────────────────────────
+     One code path for both modes: re-detect the live state (never trust
+     what was on screen), ensure the job folder, then diff the live template
+     manifest (top level + one nested level) and create ONLY what's missing.
+     Fully idempotent and race-safe: two devices running this concurrently
+     just each create the gaps the other hasn't yet — no duplicates,
+     no overwrites, no renames. ── */
+  var s0 = fvkStep('<span class="fvk-spin"></span> Re-checking current folder state…');
+  fvkFindExistingJobFolder(j.jobNumber).then(function(fresh){
+    var before = FVK_state.existing ? FVK_state.existing.ServerRelativeUrl : null;
+    var now = fresh ? fresh.ServerRelativeUrl : null;
+    if (before !== now){
+      FVK_state.existing = fresh;
+      fvkSetStep(s0, '<span class="fvk-warn">⚠ The folder situation changed since this plan was shown (another device?). Plan refreshed — review it and run again.</span>');
+      fvkAnalyze();
+      throw { fvkAbort: true };
+    }
+    destRel = fresh ? fresh.ServerRelativeUrl : (FVK_CFG.ACTIVE_ROOT + '/' + j.folderName);
+    details.folder = destRel;
+    details.mode = fresh ? 'repair' : 'create';
+    fvkSetStep(s0, '<span class="fvk-done">✓</span> ' + (fresh
+      ? 'Existing folder confirmed — filling gaps only.'
+      : 'No folder for this job yet — creating ' + fvkEscHtml(j.folderName) + '.'));
+    if (!fresh){
+      return fvkCreateFolder(FVK_CFG.JOBS_SITE, destRel);
+    }
+  }).then(function(){
+    /* Top-level template subfolders: diff live, create only the missing */
+    var s2 = fvkStep('<span class="fvk-spin"></span> Checking template subfolders…');
+    return fvkListSubfolders(FVK_CFG.JOBS_SITE, destRel).then(function(existing){
+      var missing = FVK_L.planMissing(FVK_state.templateFolders, existing.map(function(f){ return f.Name; }));
+      details.steps.push({ topLevel: { present: existing.length, toCreate: missing } });
+      fvkSetStep(s2, '<span class="fvk-done">✓</span> ' + existing.length + ' subfolders present, ' + missing.length + ' to create.');
+      var p = Promise.resolve();
+      missing.forEach(function(name){
+        p = p.then(function(){
+          var st = fvkStep('<span class="fvk-spin"></span> Creating ' + fvkEscHtml(name) + '…');
+          return fvkCreateFolder(FVK_CFG.JOBS_SITE, destRel + '/' + name).then(function(){
+            fvkSetStep(st, '<span class="fvk-done">✓</span> Created ' + fvkEscHtml(name));
+          });
+        });
+      });
+      return p;
+    });
+  }).then(function(){
+    /* Nested template folders (e.g. 08_Invoices/T&M): same diff, one level deep */
+    var p = Promise.resolve();
+    FVK_state.templateFolders.forEach(function(name){
+      p = p.then(function(){
+        return fvkListSubfolders(FVK_CFG.JOBS_SITE, FVK_CFG.TEMPLATE_FOLDER + '/' + name).then(function(nested){
+          if (!nested.length) return;
+          return fvkListSubfolders(FVK_CFG.JOBS_SITE, destRel + '/' + name).then(function(destNested){
+            var missing = FVK_L.planMissing(
+              nested.map(function(f){ return f.Name; }),
+              destNested.map(function(f){ return f.Name; }));
+            if (missing.length) details.steps.push({ nested: { parent: name, toCreate: missing } });
+            var q = Promise.resolve();
+            missing.forEach(function(nn){
+              q = q.then(function(){
+                var st = fvkStep('<span class="fvk-spin"></span> Creating ' + fvkEscHtml(name + '/' + nn) + '…');
+                return fvkCreateFolder(FVK_CFG.JOBS_SITE, destRel + '/' + name + '/' + nn).then(function(){
+                  fvkSetStep(st, '<span class="fvk-done">✓</span> Created ' + fvkEscHtml(name + '/' + nn));
+                });
+              });
+            });
+            return q;
+          });
+        }).catch(function(){ /* per-folder nested pass is best-effort */ });
+      });
+    });
+    return p;
+  }).then(function(){
+    var s4 = fvkStep('<span class="fvk-spin"></span> Verifying structure…');
+    return fvkListSubfolders(FVK_CFG.JOBS_SITE, destRel).then(function(subs){
+      details.steps.push({ verified: subs.length });
+      if (!subs.length) throw new Error('Verification failed — no subfolders found after creation.');
+      fvkSetStep(s4, '<span class="fvk-done">✓</span> Verified — ' + subs.length + ' subfolders in place.');
+    });
+  }).then(function(){
+    /* Contract seeding — create-only, skipped when one is already there */
+    if (!(contract && contract.src)) return;
+    return Promise.resolve().then(function(){
+      var s5 = fvkStep('<span class="fvk-spin"></span> Seeding contract draft…');
+      var contractFolder = destRel + '/' + FVK_CFG.CONTRACT_SUBFOLDER;
+      var newName = FVK_L.draftContractName(contract.src, j.jobNumber);
+      var baseStem = (contract.src.split('/').pop() || '').replace(/\.[^.]+$/, '').toLowerCase();
+      return fvkListFiles(FVK_CFG.JOBS_SITE, contractFolder).then(function(names){
+        var already = names.some(function(n){ return n.toLowerCase().indexOf(baseStem) === 0; });
+        if (already){
+          details.steps.push({ contract:'skipped — a copy of this contract is already in ' + FVK_CFG.CONTRACT_SUBFOLDER });
+          fvkSetStep(s5, '<span class="fvk-warn">⚠ Contract already present in ' + fvkEscHtml(FVK_CFG.CONTRACT_SUBFOLDER) + ' — left untouched.</span>');
+          return;
+        }
+        return fvkCopyFileCrossSite('/sites/Fortivo', contract.src, FVK_CFG.JOBS_SITE, contractFolder, newName)
+          .then(function(res){
+            details.steps.push({ contract: res.existed ? 'existed' : newName });
+            fvkSetStep(s5, res.existed
+              ? '<span class="fvk-warn">⚠ ' + fvkEscHtml(newName) + ' already existed — left untouched.</span>'
+              : '<span class="fvk-done">✓</span> ' + fvkEscHtml(newName) + ' → ' + fvkEscHtml(FVK_CFG.CONTRACT_SUBFOLDER));
+          });
+      });
+    });
+  }).then(function(){
+    details.result = 'Success';
+    var url = FVK_CFG.HOST + encodeURI(destRel);
+    fvkStep('<div class="fvk-result"><span class="fvk-done">✅ Job folder ready.</span> ' +
+      '<a href="' + url + '" target="_blank" rel="noopener">Open ' + fvkEscHtml(destRel.split('/').pop()) + ' →</a></div>');
+    fvkLogRun({ action:'Job Kickoff', jobNumber:j.jobNumber, result:'Success', details:details });
+  }).catch(function(err){
+    if (err && err.fvkAbort){ return; } // state changed mid-run: plan was refreshed, nothing written
+    details.result = 'Failed: ' + err.message;
+    fvkStep('<span class="fvk-err">✗ ' + fvkEscHtml(err.message) + '</span><div class="fvk-hint">Nothing was deleted or overwritten. Fix the issue and re-run — Kickoff is safe to repeat (it only fills gaps).</div>');
+    fvkLogRun({ action:'Job Kickoff', jobNumber:j.jobNumber, result:'Failed', details:details });
+  }).then(function(){
+    FVK_state.busy = false;
+    var go = fvkEl('fvk-go'); if (go){ go.disabled = false; go.textContent = 'Run again'; }
+  });
+}
+
+/* ── BOOT ─────────────────────────────────────────────────────────────────── */
+window.FVKickoff = { open: fvkOpen, close: fvkClose, _logic: FVK_L, _cfg: FVK_CFG };
+function fvkBoot(){
+  var fab = fvkEl('fvk-fab');
+  if (!fab) return;
+  fab.onclick = function(){ fvkOpen(null); };
+  fvkEl('fvk-close').onclick = fvkClose;
+  fvkEl('fvk-overlay').onclick = fvkClose;
+}
+if (typeof document !== 'undefined' && document.readyState !== 'loading') fvkBoot();
+else if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', fvkBoot);
+})();
+</script>
+<!-- ══════ FORTIVO JOB KICKOFF — END ══════ -->
