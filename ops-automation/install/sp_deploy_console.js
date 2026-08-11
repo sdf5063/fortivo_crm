@@ -28,12 +28,14 @@
 (async function fvDeploy(){
 'use strict';
 const SITE = '/sites/FortivoOperations';
+// Markers are pure ASCII on purpose — they must survive any server charset.
 const PAGES = [
   { name: 'fortivo_app',       marker: 'FORTIVO JOB KICKOFF' },
-  { name: 'fortivo_invoicing', marker: 'FORTIVO INVOICE → QUICKBOOKS DESK' },
+  { name: 'fortivo_invoicing', marker: 'QUICKBOOKS DESK' },
   // Optional: deploy the Dashboard too if its master carries a block
   { name: 'Fortivo_Dashboard', marker: 'FORTIVO JOB KICKOFF', optional: true }
 ];
+const dec = new TextDecoder('utf-8');
 const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
 const results = [];
 const enc = (s) => encodeURIComponent(String(s).replace(/'/g, "''"));
@@ -49,18 +51,23 @@ async function sp(method, url, body, contentType){
   if (method === 'DELETE'){ h['X-HTTP-Method'] = 'DELETE'; h['IF-MATCH'] = '*'; method = 'POST'; }
   return fetch(SITE + url, { method, headers: h, body });
 }
-async function getText(url){
+// Byte-preserving fetch: masters and backups travel as raw ArrayBuffers so
+// no charset decode/re-encode can corrupt em dashes, arrows, or emoji.
+// `text` is a UTF-8 view used ONLY for marker/content checks, never uploaded.
+async function getBytes(url){
   const r = await fetch(url, { headers: { Accept: 'text/html' } });
-  return { ok: r.ok, status: r.status, text: r.ok ? await r.text() : '' };
+  if (!r.ok) return { ok: false, status: r.status, buf: null, text: '' };
+  const buf = await r.arrayBuffer();
+  return { ok: true, status: r.status, buf, text: dec.decode(buf) };
 }
-async function addPage(name, html){
-  const r = await sp('POST', "/_api/web/GetFolderByServerRelativeUrl('" + SITE + "/SitePages')/Files/Add(url='" + name + "',overwrite=true)", html);
+async function addPage(name, bodyBytesOrString){
+  const r = await sp('POST', "/_api/web/GetFolderByServerRelativeUrl('" + SITE + "/SitePages')/Files/Add(url='" + name + "',overwrite=true)", bodyBytesOrString);
   if (!r.ok) throw new Error('Files/Add ' + name + ' → ' + r.status + ': ' + (await r.text()).slice(0, 200));
   // publish is best-effort — SitePages often has minor versions disabled
   try { await sp('POST', "/_api/web/GetFileByServerRelativeUrl('" + SITE + "/SitePages/" + name + "')/Publish(comment='ops-automation deploy')"); } catch (e) {}
 }
 async function renders(name, mustContain){
-  const p = await getText(SITE + '/SitePages/' + name + '?fvcb=' + Date.now());
+  const p = await getBytes(SITE + '/SitePages/' + name + '?fvcb=' + Date.now());
   if (!p.ok) return { ok: false, why: 'HTTP ' + p.status };
   if (/File Not Found|Page not found/i.test(p.text)) return { ok: false, why: 'serves "File Not Found" (custom-script save block)' };
   if (mustContain && !p.text.includes(mustContain)) return { ok: false, why: 'renders but marker "' + mustContain + '" missing' };
@@ -99,18 +106,18 @@ console.log('   ✓ canary renders');
 /* 3 ── Deploy each page whose master carries a kit block */
 for (const p of PAGES){
   console.log('3/4 ' + p.name + '…');
-  const master = await getText(SITE + '/SiteAssets/' + p.name + '.html');
+  const master = await getBytes(SITE + '/SiteAssets/' + p.name + '.html');
   if (!master.ok){ results.push([p.name, p.optional ? 'skipped (no master in Site Assets)' : 'SKIPPED — master not found']); continue; }
   if (!master.text.includes(p.marker)){ results.push([p.name, 'skipped (master has no kit block' + (p.optional ? '' : ' — run insert_snippets.js first') + ')']); continue; }
   if (!/<\/body>/i.test(master.text)) { results.push([p.name, 'ABORTED — master looks truncated (no </body>)']); continue; }
 
-  const current = await getText(SITE + '/SitePages/' + p.name + '.aspx');
-  if (current.ok && current.text.length > 500){
-    await addPage(p.name + '_backup_' + stamp + '.aspx', current.text);
+  const current = await getBytes(SITE + '/SitePages/' + p.name + '.aspx');
+  if (current.ok && current.buf.byteLength > 500){
+    await addPage(p.name + '_backup_' + stamp + '.aspx', current.buf);   // raw bytes
     console.log('   • backup: ' + p.name + '_backup_' + stamp + '.aspx');
   }
   await sp('DELETE', "/_api/web/GetFileByServerRelativeUrl('" + SITE + "/SitePages/" + p.name + ".aspx')").catch(() => {});
-  await addPage(p.name + '.aspx', master.text);          // fresh item — never overwrite-in-place
+  await addPage(p.name + '.aspx', master.buf);           // raw bytes, fresh item — never overwrite-in-place
   const v = await renders(p.name + '.aspx', p.marker);
   if (!v.ok){
     results.push([p.name, 'DEPLOYED BUT VERIFY FAILED (' + v.why + ') — restore: delete ' + p.name + '.aspx, Files/Add from ' + p.name + '_backup_' + stamp + '.aspx']);

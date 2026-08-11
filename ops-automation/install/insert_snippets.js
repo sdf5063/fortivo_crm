@@ -37,11 +37,17 @@ if (!fs.existsSync(snippetPath)) fail('snippet not found: ' + snippetPath);
 let snippet = fs.readFileSync(snippetPath, 'utf8');
 let target = fs.readFileSync(targetPath, 'utf8');
 
-// Identify the block by its title token (present in both BEGIN comment and nowhere else)
-const TOKENS = ['FORTIVO JOB KICKOFF', 'FORTIVO INVOICE → QUICKBOOKS DESK'];
-const token = TOKENS.find((t) => snippet.includes(t));
-if (!token) fail('snippet has no recognized Fortivo block token');
-const endMarker = '<!-- ══════ ' + token + ' — END ══════ -->';
+// Identify the block by its title token. Tokens and END markers are
+// deliberately pure ASCII so detection survives any charset mishandling
+// between editors, OneDrive, SharePoint, and browsers.
+const BLOCKS = [
+  { token: 'FORTIVO JOB KICKOFF', end: '<!-- ====== FORTIVO JOB KICKOFF -- END ====== -->' },
+  { token: 'QUICKBOOKS DESK', end: '<!-- ====== FORTIVO INVOICE - QUICKBOOKS DESK -- END ====== -->' }
+];
+const block = BLOCKS.find((b) => snippet.includes(b.token));
+if (!block) fail('snippet has no recognized Fortivo block token');
+const token = block.token;
+const endMarker = block.end;
 if (!snippet.includes(endMarker)) fail('snippet is missing its END marker (' + endMarker + ') — refusing to install a truncated block');
 
 // Optional relay key injection (Invoice Desk)
