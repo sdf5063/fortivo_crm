@@ -173,7 +173,25 @@ automated stamping + flattening + the standard draft email today.
    squeezing custom script; Netlify + MSAL/Graph is the proven fallback and
    these modules are already Graph-compatible.
 
-## 8. Rollout checklist (~30 min active)
+## 8. Rollout — agent-run, not a Scott task
+
+Deployment is executed by the Claude session on Scott's Mac (Cowork or Claude
+Code), which holds what this cloud session can't: the OneDrive-synced Site
+Assets masters, the authenticated SharePoint browser session, and the
+`~/fortivo-voice-email` Vercel project. Everything is scripted in
+**`install/AGENT_RUNBOOK.md`** with two executable installers
+(`install/insert_snippets.js` for the masters, `install/sp_deploy_console.js`
+for the canary-first SharePoint deploy — both idempotent, backup-first, and
+verified end-to-end).
+
+**To start it:** open Cowork on the Mac and say —
+*"Clone branch `claude/operations-dashboard-automation-fh2kgo` of
+`sdf5063/fortivo_crm` and execute `ops-automation/install/AGENT_RUNBOOK.md`
+end to end."*
+
+Scott's only moments, by design: being signed in, two deep-linked consent
+clicks (Azure `Mail.ReadWrite`, Intuit connect), and the $1 QuickBooks test
+invoice at the end. The agent's sequence, for reference:
 
 1. `npm test` in `ops-automation/` (already green) — sanity.
 2. Create `Automation_Log` list (console snippet in job-kickoff/INTEGRATION.md —

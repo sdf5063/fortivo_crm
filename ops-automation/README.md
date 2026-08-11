@@ -7,15 +7,26 @@ checklist.
 ```
 ops-automation/
 ├── BLUEPRINT.md                     ← the upgrade proposal & roadmap (start here)
+├── install/
+│   ├── AGENT_RUNBOOK.md             ← END-TO-END DEPLOY, written for the Claude
+│   │                                  session on Scott's Mac (Cowork/Claude Code)
+│   ├── insert_snippets.js           ← installs the blocks into the app masters
+│   │                                  (idempotent, backup-first, verified)
+│   └── sp_deploy_console.js         ← one-paste SharePoint deployer: Automation_Log
+│                                      list + canary + delete/Files-Add + verify
 ├── job-kickoff/
-│   ├── fv_job_kickoff.snippet.html  ← paste into fortivo_app.html (and/or Dashboard)
-│   └── INTEGRATION.md               ← paste point, Automation_Log setup, deploy steps
+│   ├── fv_job_kickoff.snippet.html  ← the ⚡ Job Kickoff block (fortivo_app + Dashboard)
+│   └── INTEGRATION.md               ← reference: behavior, probe snippets, config
 ├── invoicing/
-│   ├── fv_invoice_qb.snippet.html   ← paste into fortivo_invoicing.html
-│   ├── api/qbo-invoice.js           ← copy into ~/fortivo-voice-email/api/, deploy
-│   └── INTEGRATION.md               ← relay install, Azure Mail.ReadWrite, config
+│   ├── fv_invoice_qb.snippet.html   ← the 🧾 Invoice Desk block (fortivo_invoicing)
+│   ├── api/qbo-invoice.js           ← relay endpoint for ~/fortivo-voice-email
+│   └── INTEGRATION.md               ← reference: relay env, Azure grant, safety table
 └── test/                            ← plain-node unit tests (npm test)
 ```
+
+**Deploying:** hand `install/AGENT_RUNBOOK.md` to the Claude session on the
+Mac — it runs the whole thing. Scott's only moments: two consent clicks and
+the $1 QB test.
 
 **⚡ Job Kickoff** — one tap: job folder named `{num} ({client}-{type})`,
 all `01_Template Job Folder` subfolders cloned, correct contract draft
