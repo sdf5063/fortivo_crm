@@ -10,6 +10,15 @@ Read `memory/preferences.md` and `memory/decisions.md` first (standing deploy
 rules live there). The kit is on branch
 `claude/operations-dashboard-automation-fh2kgo` of `sdf5063/fortivo_crm`.
 
+**OS note:** paths below are Mac (per memory). The SharePoint steps (3–5) work
+from ANY machine with a signed-in browser — Windows included, if it syncs the
+"Fortivo Operations - Site Assets" OneDrive folder. Only step 1 is
+machine-bound: `~/fortivo-voice-email` currently exists ONLY on the Mac. If
+running on Windows without it, skip step 1 and run `insert_snippets.js`
+WITHOUT `--relay-key` (the desk's "Skip — enter QB # by hand" fallback keeps
+everything else working); do steps 1 and 6 next time the Mac is open. Step 6
+removes this limitation permanently.
+
 **Ground rules (non-negotiable, from decisions.md):**
 - Canary-first before touching any production page. `sp_deploy_console.js`
   enforces this — it aborts without touching production if the canary fails.
@@ -117,7 +126,44 @@ nav must still work.
    draft email to himself → confirm, then delete the $1 invoice in QB.
 4. Confirm `Automation_Log` now has rows for kickoff, QB sync, stamp, draft.
 
-## 6. Close out
+## 6. One-time: unchain fortivo-voice-email from the Mac (GitHub + Vercel git)
+
+Today the relay project lives only in `~/fortivo-voice-email` on the Mac,
+which is why relay changes require the Mac at all. Fix that permanently:
+
+```bash
+cd ~/fortivo-voice-email
+# 6a. SECRETS SWEEP — do not push until this is clean. Env vars live in
+#     Vercel, tokens live in the encrypted Blob store; NONE of that belongs
+#     in git. Verify .gitignore covers at least:
+#       .env .env.* .vercel node_modules *.pem
+#     then scan the tree for anything that looks like a credential:
+grep -rInE 'sk-ant|client_secret|refresh_token|api[_-]?key.{0,4}[:=].{8,}' \
+  --exclude-dir=node_modules --exclude-dir=.git . | grep -v 'process\.env' || echo CLEAN
+ls ~/.fortivo/ 2>/dev/null   # qb_credentials.json lives HERE, outside the repo — leave it there
+# Anything hot found inside the project: move it to Vercel env vars first,
+# purge the file, and only then continue.
+
+# 6b. Init + push to a PRIVATE repo
+git init 2>/dev/null; git add -A && git commit -m "Import fortivo-voice-email (relay: voice email, morning brief, ops rules, qbo-project, qbo-invoice)"
+# Create PRIVATE repo sdf5063/fortivo-voice-email (gh CLI or github.com → New),
+# then:
+git remote add origin https://github.com/sdf5063/fortivo-voice-email.git
+git branch -M main && git push -u origin main
+```
+
+6c. In the Vercel dashboard: project **fortivo-voice-email** → Settings → Git
+→ Connect to `sdf5063/fortivo-voice-email`. From then on, a push to `main`
+deploys automatically — cloud Claude sessions can maintain the relay without
+the Mac. Verify with a no-op commit that a deployment triggers and the
+existing env vars / blob store carry over (they're project-level, so they do).
+
+6d. Record the new repo + git-deploy flow in `memory/decisions.md`.
+
+**Repo stays PRIVATE** — it's infrastructure code; even clean of secrets,
+there's no reason to publish it.
+
+## 7. Close out
 
 - Merge `claude/operations-dashboard-automation-fh2kgo` → `main` in both
   `fortivo_crm` and `fortivo-memory` (memory updates ride that branch).
