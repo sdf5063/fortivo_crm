@@ -1,5 +1,13 @@
 # Invoice → QuickBooks Desk — Integration Guide
 
+> **Also install `fv_wizard_safety.snippet.html`** (paste before the closing
+> body tag, next to the desk block). It's the defensive answer to the lost
+> $1-invoice mystery: a read-only Draft Recorder (every keystroke recoverable
+> from a 🛟 panel) plus a save watchdog that shows a loud red banner when a
+> write to the Invoices list fails and a green "Saved ✓" when it lands —
+> silence can no longer mean "lost". It never writes to SharePoint and never
+> alters the app's requests.
+
 Automates the manual invoice ritual end to end while keeping you in control of
 every client-facing action:
 

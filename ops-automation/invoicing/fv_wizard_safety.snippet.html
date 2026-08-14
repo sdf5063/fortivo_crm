@@ -1,0 +1,212 @@
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     FORTIVO WIZARD SAFETY NET (FVW) — self-contained drop-in block
+     ───────────────────────────────────────────────────────────────────────────
+     Paste this ENTIRE block into fortivo_invoicing.html directly BEFORE the
+     closing body tag (alongside the Invoice Desk block).
+
+     Why it exists: a $1 test invoice vanished between the app's 4-step wizard
+     and the Invoices list (2026-08-14) and nobody could tell whether the
+     wizard lost it on back-navigation (known bug in decisions.md) or a save
+     silently failed. This block makes BOTH failure modes impossible to miss:
+
+       1. DRAFT RECORDER — every keystroke in the app is captured to
+          localStorage (label → value). If the wizard eats your data, nothing
+          is lost: a 🛟 chip opens a panel with everything you typed, with
+          copy buttons. (It never auto-fills — recovery is manual on purpose;
+          this observer cannot corrupt anything.)
+       2. SAVE WATCHDOG — watches the app's own calls to the Invoices list.
+          A failed save shows a loud, persistent red banner with the HTTP
+          error. A successful save shows "Saved ✓" and retires the draft.
+          Silence can no longer mean either "saved" or "lost".
+
+     Read-only by design: this block never writes to SharePoint, never blocks
+     or alters the app's requests, and stores drafts only in this browser.
+     ═══════════════════════════════════════════════════════════════════════ -->
+<style>
+  #fvw-chip{position:fixed;left:14px;bottom:30px;z-index:99989;background:#8a6100;color:#fff;
+    border:none;border-radius:20px;padding:9px 14px;font-size:13px;font-weight:700;cursor:pointer;
+    box-shadow:0 3px 10px rgba(0,0,0,.3);display:none}
+  #fvw-toast{position:fixed;left:50%;transform:translateX(-50%);bottom:86px;z-index:100001;display:none;
+    max-width:min(560px,92vw);padding:12px 16px;border-radius:10px;font-size:14px;font-weight:600;color:#fff;
+    box-shadow:0 6px 18px rgba(0,0,0,.35)}
+  #fvw-toast.ok{background:#1c7a34}
+  #fvw-toast.err{background:#b3261e}
+  #fvw-toast button{float:right;background:none;border:none;color:#fff;font-size:16px;cursor:pointer;margin-left:10px}
+  #fvw-panel{position:fixed;left:14px;bottom:76px;z-index:100000;width:min(420px,92vw);max-height:60vh;overflow:auto;
+    background:#fff;color:#1c2b3a;border:1px solid #dbe4ef;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.4);
+    display:none;font-size:13px}
+  #fvw-panel .fvw-h{background:#19345E;color:#fff;padding:10px 12px;font-weight:700;display:flex;justify-content:space-between}
+  #fvw-panel .fvw-h button{background:none;border:none;color:#fff;cursor:pointer;font-size:15px}
+  #fvw-panel .fvw-row{padding:7px 12px;border-bottom:1px solid #eef2f7;display:flex;gap:8px;align-items:baseline}
+  #fvw-panel .fvw-row b{flex:0 0 38%;color:#19345E;word-break:break-word}
+  #fvw-panel .fvw-row span{flex:1;word-break:break-word}
+  #fvw-panel .fvw-row button{flex:0 0 auto;background:#eef2f7;border:none;border-radius:6px;padding:2px 8px;cursor:pointer}
+  #fvw-panel .fvw-foot{padding:10px 12px;display:flex;gap:8px;justify-content:space-between;color:#5a6b7e}
+  #fvw-panel .fvw-foot button{background:#fdecea;color:#b3261e;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-weight:700}
+</style>
+<button id="fvw-chip" type="button">🛟 Draft Recorder</button>
+<div id="fvw-toast"></div>
+<div id="fvw-panel"></div>
+<script>
+(function(){
+'use strict';
+var FVW_CFG = {
+  STORE: 'fvw_draft_v1',
+  LIST: 'Invoices',
+  IGNORE: /^(fvq-|fvk-|fvw-)/,          // don't record the kit's own modals
+  MIN_LEN: 1
+};
+
+/* ── pure logic (FVWizardGuard._logic — covered by the node test suite) ──── */
+var FVW_L = {
+  // Human label for a captured element (best-effort, in priority order)
+  labelFor: function(meta){
+    return (meta.label || meta.placeholder || meta.name || meta.id || 'field').toString().trim().slice(0, 60) || 'field';
+  },
+  // Is this fetch a create/update against the Invoices list?
+  classifyRequest: function(url, method, headers){
+    var u = String(url || '');
+    if (u.indexOf("getbytitle('" + FVW_CFG.LIST + "')/items") === -1) return null;
+    var m = String(method || 'GET').toUpperCase();
+    if (m !== 'POST') return null;
+    var h = headers || {};
+    var xm = (h['X-HTTP-Method'] || h['x-http-method'] || '').toUpperCase();
+    if (xm === 'MERGE') return 'update';
+    if (xm === 'DELETE') return null;                  // deletes are the app's business
+    return /items\(\d+\)/.test(u) ? 'update' : 'create';
+  },
+  merge: function(draft, key, value){
+    draft = draft || { startedAt: Date.now(), fields: {} };
+    var v = String(value == null ? '' : value);
+    if (v.length >= FVW_CFG.MIN_LEN) draft.fields[key] = v;
+    else delete draft.fields[key];
+    draft.updatedAt = Date.now();
+    return draft;
+  },
+  count: function(draft){ return draft && draft.fields ? Object.keys(draft.fields).length : 0; }
+};
+
+/* ── storage ─────────────────────────────────────────────────────────────── */
+function load(){ try { return JSON.parse(localStorage.getItem(FVW_CFG.STORE) || 'null'); } catch (e){ return null; } }
+var saveTimer = null, draft = null;
+function persist(){
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(function(){
+    try { draft ? localStorage.setItem(FVW_CFG.STORE, JSON.stringify(draft)) : localStorage.removeItem(FVW_CFG.STORE); } catch (e){}
+    syncChip();
+  }, 400);
+}
+
+/* ── UI ──────────────────────────────────────────────────────────────────── */
+function el(id){ return document.getElementById(id); }
+function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+  return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]; }); }
+function syncChip(){
+  var c = el('fvw-chip');
+  if (c) c.style.display = FVW_L.count(draft) ? 'block' : 'none';
+}
+var toastTimer = null;
+function toast(kind, html, sticky){
+  var t = el('fvw-toast');
+  if (!t) return;
+  t.className = kind;
+  t.innerHTML = '<button onclick="this.parentNode.style.display=\'none\'">×</button>' + html;
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  if (!sticky) toastTimer = setTimeout(function(){ t.style.display = 'none'; }, 6000);
+}
+function showPanel(){
+  var p = el('fvw-panel');
+  if (!p || !draft) return;
+  var rows = Object.keys(draft.fields).map(function(k){
+    return '<div class="fvw-row"><b>' + esc(k) + '</b><span>' + esc(draft.fields[k]) + '</span>' +
+      '<button data-fvw="' + esc(k) + '">copy</button></div>';
+  }).join('');
+  p.innerHTML = '<div class="fvw-h"><span>🛟 Recorded draft (' + FVW_L.count(draft) + ' fields, ' +
+    new Date(draft.updatedAt).toLocaleTimeString() + ')</span><button id="fvw-close">×</button></div>' +
+    rows +
+    '<div class="fvw-foot"><span>Recovery reference — re-enter in the wizard.</span>' +
+    '<button id="fvw-clear">Clear draft</button></div>';
+  p.style.display = 'block';
+  el('fvw-close').onclick = function(){ p.style.display = 'none'; };
+  el('fvw-clear').onclick = function(){
+    if (!confirm('Clear the recorded draft? (Only do this once the invoice is saved.)')) return;
+    draft = null; persist(); p.style.display = 'none';
+  };
+  Array.prototype.forEach.call(p.querySelectorAll('button[data-fvw]'), function(b){
+    b.onclick = function(){
+      var v = draft && draft.fields[b.getAttribute('data-fvw')];
+      if (navigator.clipboard && v != null) navigator.clipboard.writeText(v).then(function(){ b.textContent = '✓'; });
+    };
+  });
+}
+
+/* ── capture ─────────────────────────────────────────────────────────────── */
+function onInput(e){
+  var t = e.target;
+  if (!t || !t.tagName) return;
+  var tag = t.tagName.toUpperCase();
+  if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') return;
+  if (t.type === 'password') return;
+  if (FVW_CFG.IGNORE.test(t.id || '')) return;
+  var labelText = '';
+  try {
+    if (t.id){ var l = document.querySelector('label[for="' + t.id + '"]'); if (l) labelText = l.textContent; }
+    if (!labelText && t.closest){ var pl = t.closest('label'); if (pl) labelText = pl.textContent; }
+  } catch (err){}
+  var key = FVW_L.labelFor({ label: labelText, placeholder: t.placeholder, name: t.name, id: t.id });
+  draft = FVW_L.merge(draft, key, tag === 'SELECT' ? (t.options[t.selectedIndex] || {}).text : t.value);
+  persist();
+}
+
+/* ── save watchdog (observing wrapper — never blocks or alters requests) ─── */
+function wrapFetch(){
+  if (typeof window.fetch !== 'function' || window.fetch.__fvw) return;
+  var orig = window.fetch;
+  var wrapped = function(input, init){
+    var url = (typeof input === 'string') ? input : (input && input.url) || '';
+    var method = (init && init.method) || (input && input.method) || 'GET';
+    var headers = (init && init.headers) || {};
+    var kind = null;
+    try { kind = FVW_L.classifyRequest(url, method, headers); } catch (e){}
+    var p = orig.apply(this, arguments);
+    if (kind){
+      p.then(function(resp){
+        if (resp.ok){
+          if (kind === 'create'){
+            draft = null; persist();
+            toast('ok', '✓ Invoice saved to the ' + FVW_CFG.LIST + ' list.');
+          }
+        } else {
+          toast('err', '⚠ Invoice ' + kind + ' FAILED (HTTP ' + resp.status + '). Your entries are safe in the 🛟 Draft Recorder (bottom-left). Do not close this tab assuming it saved.', true);
+        }
+      }).catch(function(){
+        toast('err', '⚠ Invoice ' + (kind || 'save') + ' never reached SharePoint (network error). Your entries are safe in the 🛟 Draft Recorder.', true);
+      });
+    }
+    return p;
+  };
+  wrapped.__fvw = true;
+  window.fetch = wrapped;
+}
+
+/* ── boot ────────────────────────────────────────────────────────────────── */
+window.FVWizardGuard = { _logic: FVW_L, _cfg: FVW_CFG, open: showPanel };
+function fvwBoot(){
+  if (!el('fvw-chip')) return;
+  draft = load();
+  document.addEventListener('input', onInput, true);
+  document.addEventListener('change', onInput, true);
+  el('fvw-chip').onclick = showPanel;
+  wrapFetch();
+  syncChip();
+  if (FVW_L.count(draft)){
+    toast('ok', '🛟 A recorded draft from ' + new Date(draft.updatedAt).toLocaleString() +
+      ' is available (' + FVW_L.count(draft) + ' fields) — tap the Draft Recorder chip if you lost work.');
+  }
+}
+if (typeof document !== 'undefined' && document.readyState !== 'loading') fvwBoot();
+else if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', fvwBoot);
+})();
+</script>
+<!-- ====== FORTIVO WIZARD SAFETY NET -- END ====== -->
