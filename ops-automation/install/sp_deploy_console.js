@@ -60,8 +60,21 @@ async function getBytes(url){
   const buf = await r.arrayBuffer();
   return { ok: true, status: r.status, buf, text: dec.decode(buf) };
 }
+// Upload method per the 2026-08-14 canary matrix: plain strings and BOM-less
+// bytes both came back corrupted; UTF-8 **with BOM** served clean. So every
+// page body goes up as a text/html Blob with a UTF-8 BOM prepended (raw bytes
+// otherwise untouched; existing BOMs are not doubled). The canary below
+// PROVES the round-trip on this tenant before any production page is touched.
+function withBom(bytesOrString){
+  if (typeof bytesOrString === 'string'){
+    return new Blob(['﻿' + bytesOrString.replace(/^﻿/, '')], { type: 'text/html' });
+  }
+  const b = new Uint8Array(bytesOrString);
+  const hasBom = b.length >= 3 && b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF;
+  return new Blob(hasBom ? [b] : [new Uint8Array([0xEF, 0xBB, 0xBF]), b], { type: 'text/html' });
+}
 async function addPage(name, bodyBytesOrString){
-  const r = await sp('POST', "/_api/web/GetFolderByServerRelativeUrl('" + SITE + "/SitePages')/Files/Add(url='" + name + "',overwrite=true)", bodyBytesOrString);
+  const r = await sp('POST', "/_api/web/GetFolderByServerRelativeUrl('" + SITE + "/SitePages')/Files/Add(url='" + name + "',overwrite=true)", withBom(bodyBytesOrString));
   if (!r.ok) throw new Error('Files/Add ' + name + ' → ' + r.status + ': ' + (await r.text()).slice(0, 200));
   // publish is best-effort — SitePages often has minor versions disabled
   try { await sp('POST', "/_api/web/GetFileByServerRelativeUrl('" + SITE + "/SitePages/" + name + "')/Publish(comment='ops-automation deploy')"); } catch (e) {}
@@ -93,15 +106,23 @@ if (listCheck.ok){
   console.log('   ✓ created with internal names Job_Number / Result / Details');
 }
 
-/* 2 ── Canary (HARD RULE: no canary, no deploy) */
-console.log('2/4 canary render test…');
-await addPage('fv_test_render.aspx', '<html><body>fv-canary-ok-' + stamp + '</body></html>');
+/* 2 ── Canary (HARD RULE: no canary, no deploy) — proves BOTH that saves
+       render AND that non-ASCII text (em dash, arrow, emoji) survives the
+       upload/serve round-trip. Either failure aborts before production. */
+console.log('2/4 canary render + encoding test…');
+const CANARY_PROBE = 'fv-canary-ok-' + stamp + ' — → ⚡';   // "— → ⚡"
+await addPage('fv_test_render.aspx', '<html><head><meta charset="utf-8"></head><body>' + CANARY_PROBE + '</body></html>');
 const canary = await renders('fv_test_render.aspx', 'fv-canary-ok-' + stamp);
 if (!canary.ok){
   await sp('DELETE', "/_api/web/GetFileByServerRelativeUrl('" + SITE + "/SitePages/fv_test_render.aspx')").catch(() => {});
   throw new Error('CANARY FAILED (' + canary.why + ') — custom-script saves are blocked. Flip DenyAddAndCustomizePages (CSOM recipe in preferences.md), wait for propagation, re-run until the canary passes TWICE. Production pages were NOT touched.');
 }
-console.log('   ✓ canary renders');
+const canaryEnc = await renders('fv_test_render.aspx', CANARY_PROBE);
+if (!canaryEnc.ok){
+  await sp('DELETE', "/_api/web/GetFileByServerRelativeUrl('" + SITE + "/SitePages/fv_test_render.aspx')").catch(() => {});
+  throw new Error('CANARY ENCODING FAILED — the page renders but em dash/arrow/emoji came back corrupted, so a real deploy would mojibake the apps. Do NOT deploy. (Upload used UTF-8+BOM text/html, the method proven clean on 2026-08-14 — if this fails, the tenant behavior changed; investigate before proceeding.) Production pages were NOT touched.');
+}
+console.log('   ✓ canary renders, non-ASCII round-trip clean');
 
 /* 3 ── Deploy each page whose master carries a kit block */
 for (const p of PAGES){

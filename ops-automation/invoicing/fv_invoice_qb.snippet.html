@@ -703,12 +703,49 @@ function fvqStep4(){
 
 /* ── BOOT ─────────────────────────────────────────────────────────────────── */
 window.FVInvoiceQB = { open: fvqOpen, close: fvqClose, _logic: FVQ_L, _cfg: FVQ_CFG };
+// The floating button covered the app's own "+ New Invoice" button (measured
+// overlap at 1470x754). Preferred launcher is a .nav-item in the app sidebar,
+// styled by the app's own CSS; the fab is hidden and kept only as a fallback
+// when no sidebar exists (e.g. this block pasted on a page without one).
+function fvqMountLauncher(){
+  var fab = fvqEl('fvq-fab');
+  try {
+    var nav = document.querySelector('nav.sidebar-nav') || document.querySelector('.sidebar-nav');
+    if (nav){
+      var items = nav.querySelectorAll('.nav-item');
+      var anchor = null;
+      for (var i = 0; i < items.length; i++){
+        if (/navigate\('create'\)/.test(items[i].getAttribute('onclick') || '')){ anchor = items[i]; break; }
+      }
+      var item;
+      if (anchor){
+        item = anchor.cloneNode(true);            // inherit the app's item structure/styling
+        item.removeAttribute('onclick');
+        item.classList.remove('active');
+        item.textContent = '🧾 QB Invoice Desk';
+      } else {
+        item = document.createElement('div');
+        item.className = 'nav-item';
+        item.textContent = '🧾 QB Invoice Desk';
+      }
+      item.id = 'fvq-nav-item';
+      item.setAttribute('role', 'button');
+      item.onclick = fvqOpen;
+      if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(item, anchor.nextSibling);
+      else nav.appendChild(item);
+      if (fab) fab.style.display = 'none';
+      return true;
+    }
+  } catch (e){ /* fall through to fab */ }
+  return false;
+}
 function fvqBoot(){
   var fab = fvqEl('fvq-fab');
   if (!fab) return;
   fab.onclick = fvqOpen;
   fvqEl('fvq-close').onclick = fvqClose;
   fvqEl('fvq-overlay').onclick = fvqClose;
+  fvqMountLauncher();
 }
 if (typeof document !== 'undefined' && document.readyState !== 'loading') fvqBoot();
 else if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', fvqBoot);

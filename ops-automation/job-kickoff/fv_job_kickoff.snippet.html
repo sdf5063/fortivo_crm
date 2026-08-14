@@ -455,17 +455,37 @@ function fvkAnalyze(){
   ]).then(function(res){
     FVK_state.templateFolders = res[0].map(function(f){ return f.Name; });
     FVK_state.existing = res[1];
+    // Repair mode previews the actual DIFF (what exists vs what's missing),
+    // not the raw template manifest — execution always diffed; now the
+    // preview matches what execution will really do.
+    var existingP = FVK_state.existing
+      ? fvkListSubfolders(FVK_CFG.JOBS_SITE, FVK_state.existing.ServerRelativeUrl)
+          .then(function(s){ return s.map(function(f){ return f.Name; }); })
+      : Promise.resolve(null);
+    return existingP;
+  }).then(function(existingNames){
+    var j2 = fvkReadForm();
     var html = '';
     if (FVK_state.existing){
+      var missing = FVK_L.planMissing(FVK_state.templateFolders, existingNames || []);
       html += '<div><span class="fvk-badge repair">FOLDER EXISTS</span> <b>' + fvkEscHtml(FVK_state.existing.Name) +
-              '</b> — switching to <b>verify &amp; repair</b>: only missing subfolders will be added. Nothing is ever overwritten.</div>';
+              '</b> — <b>verify &amp; repair</b>: ' + ((existingNames || []).length) + ' subfolders present, ' +
+              missing.length + ' to create. Nothing is ever overwritten.</div>';
+      var have = {};
+      (existingNames || []).forEach(function(n){ have[String(n).toLowerCase()] = true; });
+      html += '<ul>' + FVK_state.templateFolders.map(function(n){
+        return have[String(n).toLowerCase()]
+          ? '<li class="fvk-ok">✓ ' + fvkEscHtml(n) + ' — present</li>'
+          : '<li class="fvk-new">+ ' + fvkEscHtml(n) + '</li>';
+      }).join('') + '</ul>';
+      if (!missing.length) html += '<div class="fvk-ok">Structure complete — only the contract check will run.</div>';
     } else {
-      html += '<div><span class="fvk-badge create">NEW</span> Will create <b>' + fvkEscHtml(j.folderName) +
+      html += '<div><span class="fvk-badge create">NEW</span> Will create <b>' + fvkEscHtml(j2.folderName) +
               '</b> in 01_Active Jobs/01_Job Name and copy the full template structure:</div>';
+      html += '<ul>' + FVK_state.templateFolders.map(function(n){ return '<li class="fvk-new">+ ' + fvkEscHtml(n) + '</li>'; }).join('') + '</ul>';
     }
-    html += '<ul>' + FVK_state.templateFolders.map(function(n){ return '<li class="fvk-new">+ ' + fvkEscHtml(n) + '</li>'; }).join('') + '</ul>';
-    var c = FVK_CFG.CONTRACTS.find(function(x){ return x.id === j.contractId; });
-    if (c && c.src) html += '<div class="fvk-new">+ ' + fvkEscHtml(FVK_L.draftContractName(c.src, j.jobNumber)) + ' → ' + fvkEscHtml(FVK_CFG.CONTRACT_SUBFOLDER) + '</div>';
+    var c = FVK_CFG.CONTRACTS.find(function(x){ return x.id === j2.contractId; });
+    if (c && c.src) html += '<div class="fvk-new">+ ' + fvkEscHtml(FVK_L.draftContractName(c.src, j2.jobNumber)) + ' → ' + fvkEscHtml(FVK_CFG.CONTRACT_SUBFOLDER) + '</div>';
     planEl.innerHTML = html;
     var go = fvkEl('fvk-go');
     go.disabled = false;
