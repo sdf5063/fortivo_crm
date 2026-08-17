@@ -42,7 +42,8 @@ let target = fs.readFileSync(targetPath, 'utf8');
 // between editors, OneDrive, SharePoint, and browsers.
 const BLOCKS = [
   { token: 'FORTIVO JOB KICKOFF', end: '<!-- ====== FORTIVO JOB KICKOFF -- END ====== -->' },
-  { token: 'QUICKBOOKS DESK', end: '<!-- ====== FORTIVO INVOICE - QUICKBOOKS DESK -- END ====== -->' }
+  { token: 'QUICKBOOKS DESK', end: '<!-- ====== FORTIVO INVOICE - QUICKBOOKS DESK -- END ====== -->' },
+  { token: 'FORTIVO EDIT JOB', end: '<!-- ====== FORTIVO EDIT JOB -- END ====== -->' }
 ];
 const block = BLOCKS.find((b) => snippet.includes(b.token));
 if (!block) fail('snippet has no recognized Fortivo block token');
