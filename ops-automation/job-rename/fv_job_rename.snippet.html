@@ -1,0 +1,593 @@
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     FORTIVO EDIT JOB (FVR) — rename / renumber a job, self-contained drop-in
+     ───────────────────────────────────────────────────────────────────────────
+     Paste this ENTIRE block into fortivo_app.html directly BEFORE </body>
+     (same pattern as the Job Kickoff block — the two coexist).
+
+     What it does (pick a job → edit → confirm plan → apply):
+       1. Edits the Jobs_Master row: job number, client name, job name (MERGE —
+          only the changed fields are written)
+       2. Renames the job folder in 01_Active Jobs/01_Job Name/ to match, via
+          FileLeafRef (an in-place rename: contents, sharing links and version
+          history are preserved; nothing is moved or copied)
+       3. Enforces the Fortivo numbering convention (YY-PP-NNNNN):
+            - NNNNN (last 5) is the job's PERMANENT identity — a phase change
+              (mitigation → rebuild) keeps NNNNN and flips PP; YY may update to
+              the new phase's start year. Changing NNNNN is allowed only as an
+              explicit "fix a wrong number" action and is loudly flagged.
+            - Blocks a new number that another job already holds (the
+              26-01-00043 Ansaldo/Peters collision class of error)
+            - Warns when the target NNNNN belongs to a different client
+       4. Writes an audit entry to the Automation_Log list (best-effort)
+
+     DATA SAFETY GUARANTEES:
+       - Never deletes; never touches files inside the job folder.
+       - The folder rename aborts if a folder with the target name exists.
+       - State is re-read immediately before applying; if the row changed on
+         another device since the form was opened, the run aborts and refreshes.
+       - Dry-run toggle shows the exact plan without touching SharePoint.
+       - QuickBooks is NOT written: the plan lists the matching QBO project
+         rename as a manual follow-up (QB → Sales → Customers → project → Edit).
+
+     Optional deeper integration:
+       window.FVJobRename.open({jobNumber: '26-01-00043'})   // preselect
+     ═══════════════════════════════════════════════════════════════════════ -->
+<style>
+  #fvr-fab{position:fixed;right:18px;bottom:144px;z-index:99990;background:#19345E;color:#fff;
+    border:2px solid #1292D1;border-radius:26px;padding:12px 18px;font-size:15px;font-weight:600;
+    cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.35);display:flex;align-items:center;gap:8px}
+  #fvr-fab:hover{background:#1292D1}
+  #fvr-overlay{position:fixed;inset:0;background:rgba(10,20,40,.55);z-index:99998;display:none}
+  #fvr-modal{position:fixed;z-index:99999;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:min(680px,94vw);max-height:88vh;overflow:auto;background:#fff;border-radius:12px;
+    box-shadow:0 12px 40px rgba(0,0,0,.45);display:none;font-family:inherit;color:#1c2b3a;
+    -webkit-overflow-scrolling:touch}
+  .fvr-head{background:#19345E;color:#fff;padding:14px 18px;border-radius:12px 12px 0 0;
+    display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:2}
+  .fvr-head h3{margin:0;font-size:17px}
+  .fvr-x{background:none;border:none;color:#fff;font-size:22px;cursor:pointer;line-height:1;min-width:44px;min-height:44px}
+  .fvr-body{padding:16px 18px 22px}
+  .fvr-row{margin-bottom:14px}
+  .fvr-row label{display:block;font-size:12px;font-weight:700;color:#19345E;text-transform:uppercase;
+    letter-spacing:.4px;margin-bottom:4px}
+  .fvr-row input[type=text]{width:100%;box-sizing:border-box;padding:10px;border:1px solid #c6d2e0;
+    border-radius:8px;font-size:15px;background:#fff;color:#1c2b3a}
+  .fvr-row input:focus{outline:2px solid #1292D1}
+  .fvr-hint{font-size:12px;color:#5a6b7e;margin-top:3px}
+  .fvr-plan{background:#f4f7fb;border:1px solid #dbe4ef;border-radius:8px;padding:10px 12px;font-size:13px;
+    max-height:240px;overflow:auto}
+  .fvr-plan li{margin:3px 0}
+  .fvr-ok{color:#1c7a34}
+  .fvr-warn{color:#8a6100}
+  .fvr-err{color:#b02a2a}
+  .fvr-actions{display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap}
+  .fvr-btn{padding:11px 18px;border-radius:8px;border:none;font-size:15px;font-weight:600;cursor:pointer;min-height:44px}
+  .fvr-btn.primary{background:#1292D1;color:#fff}
+  .fvr-btn.primary:disabled{background:#9db6c8;cursor:default}
+  .fvr-btn.ghost{background:#eef3f9;color:#19345E}
+  .fvr-drh{font-size:13px;color:#5a6b7e;display:flex;align-items:center;gap:6px}
+  .fvr-status{margin-top:12px;font-size:13px}
+  .fvr-joblist{max-height:300px;overflow:auto;border:1px solid #dbe4ef;border-radius:8px;margin-top:8px}
+  .fvr-joblist div{padding:10px 12px;border-bottom:1px solid #eef3f9;cursor:pointer;font-size:14px}
+  .fvr-joblist div:hover{background:#eaf4fb}
+  @media (max-width:640px){ #fvr-fab{bottom:156px;right:12px} .fvr-body{padding:12px 12px 18px} }
+</style>
+
+<button id="fvr-fab" type="button" title="Rename or renumber a job">✏️ Edit Job</button>
+<div id="fvr-overlay"></div>
+<div id="fvr-modal" role="dialog" aria-modal="true" aria-label="Edit Job">
+  <div class="fvr-head"><h3>✏️ Edit Job — Rename / Renumber</h3>
+    <button class="fvr-x" id="fvr-close" aria-label="Close">×</button></div>
+  <div class="fvr-body" id="fvr-body"><!-- rendered by JS --></div>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ── CONFIG — keep paths/pattern in sync with the Job Kickoff block ───────── */
+var FVR_CFG = {
+  HOST: (typeof location !== 'undefined' && location.origin) || 'https://fortivopropertyservices.sharepoint.com',
+  OPS_SITE:  '/sites/FortivoOperations',
+  JOBS_SITE: '/sites/ActiveJobs',
+  ACTIVE_ROOT: '/sites/ActiveJobs/Shared Documents/01_Active Jobs/01_Job Name',
+  TEMPLATE_FOLDER_NAME: '01_Template Job Folder',
+  JOBS_LIST: 'Jobs_Master',
+  LOG_LIST: 'Automation_Log',
+  NAME_PATTERN: '{num} ({client}-{type})',   // real observed folder: 26-02-00043 (Peters-Repair)
+  TYPE_SHORT: { Mitigation:'Mit', Repair:'Repair', Reconstruction:'Recon', Contents:'Contents', Other:'' },
+  // Fortivo numbering convention: YY-PP-NNNNN.
+  //   NNNNN = permanent job identity, kept across phases.
+  //   PP    = classification code; flips on phase change (mit → rebuild).
+  //   YY    = start year of the CURRENT phase (may advance with a new phase).
+  // Codes confirmed from live QBO data: 01, 02. Codes 05 and 99 are in live
+  // use (26-05-00039, 26-99-00017/27/30) — labels pending Scott's confirmation.
+  PHASE_LABELS: { '01':'Mitigation', '02':'Repair/Reconstruction', '05':'05 (unconfirmed)', '99':'99 (unconfirmed)' },
+  FIELDS: {
+    jobNumber:  ['Job_Number','JobNumber','Title'],
+    clientName: ['Client_Name','Client','Account_Name'],
+    jobName:    ['Job_Name','JobName','Name'],
+    status:     ['Status','Job_Status']
+  }
+};
+
+/* ── PURE LOGIC (exposed as FVJobRename._logic for the node test suite) ───── */
+var FVR_L = {
+  parseJobNumber: function(s){
+    var m = /^(\d{2})-(\d{2})-(\d{5})$/.exec(String(s || '').trim());
+    return m ? { yy:m[1], pp:m[2], seq:m[3] } : null;
+  },
+  phaseLabel: function(pp){
+    return FVR_CFG.PHASE_LABELS[pp] || ('code ' + pp);
+  },
+  sanitizeName: function(s){
+    return String(s || '')
+      .replace(/["*:<>?\/\\|#%]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/^[\s.]+|[\s.]+$/g, '');
+  },
+  buildFolderName: function(job){
+    var type = FVR_CFG.TYPE_SHORT[job.jobType] !== undefined ? FVR_CFG.TYPE_SHORT[job.jobType] : (job.jobType || '');
+    var name = FVR_CFG.NAME_PATTERN
+      .replace('{num}', job.jobNumber || '')
+      .replace('{client}', job.clientName || '')
+      .replace('{type}', type);
+    name = name.replace(/-\)/g, ')').replace(/\(\s*-/g, '(').replace(/\(\s*\)/g, '');
+    return FVR_L.sanitizeName(name);
+  },
+  // The convention check. Returns [{level:'block'|'warn'|'info', msg}].
+  // allJobs = every Jobs_Master row (mapped), used for collision detection.
+  validateChange: function(oldJob, newJob, allJobs){
+    var out = [];
+    // Standing rule: never degrade existing job data — a populated field can
+    // be corrected but never blanked from this tool.
+    [['jobNumber','Job number'],['clientName','Client name'],['jobName','Job name']].forEach(function(f){
+      if (newJob[f[0]] === undefined) return; // field not part of this edit
+      if (String(oldJob[f[0]] || '').trim() && !String(newJob[f[0]] || '').trim()){
+        out.push({ level:'block', msg: f[1] + ' cannot be cleared — existing job data is never blanked' });
+      }
+    });
+    var np = FVR_L.parseJobNumber(newJob.jobNumber);
+    if (!np){
+      out.push({ level:'block', msg:'Job number must be YY-PP-NNNNN (e.g. 26-02-00043)' });
+      return out;
+    }
+    var op = FVR_L.parseJobNumber(oldJob.jobNumber);
+
+    // Full-number collision with ANY other row is never allowed.
+    var clash = (allJobs || []).find(function(j){
+      return j.spId !== oldJob.spId && String(j.jobNumber).trim() === String(newJob.jobNumber).trim();
+    });
+    if (clash){
+      out.push({ level:'block', msg:'Number ' + newJob.jobNumber + ' is already used by ' +
+        (clash.clientName || 'another job') + ' — every full job number must be unique' });
+    }
+
+    if (op && op.seq !== np.seq){
+      out.push({ level:'warn', msg:'Last-5 change (' + op.seq + ' → ' + np.seq + '): the sequence is the job’s ' +
+        'permanent identity. Do this only to FIX a wrongly assigned number, never for a phase change.' });
+      // When adopting a sequence, it must not belong to a different client.
+      var owner = (allJobs || []).find(function(j){
+        var jp = FVR_L.parseJobNumber(j.jobNumber);
+        return j.spId !== oldJob.spId && jp && jp.seq === np.seq &&
+          String(j.clientName || '').trim().toLowerCase() !== String(newJob.clientName || '').trim().toLowerCase();
+      });
+      if (owner){
+        out.push({ level:'warn', msg:'Sequence ' + np.seq + ' already belongs to ' + (owner.clientName || '?') +
+          ' (' + owner.jobNumber + ') — phases of one job share one client' });
+      }
+    } else if (op && op.pp !== np.pp){
+      out.push({ level:'info', msg:'Phase change: ' + FVR_L.phaseLabel(op.pp) + ' → ' + FVR_L.phaseLabel(np.pp) +
+        ' (sequence ' + np.seq + ' kept — correct)' });
+    }
+    if (op && op.yy !== np.yy && op.seq === np.seq){
+      out.push({ level:'info', msg:'Year 20' + op.yy + ' → 20' + np.yy + ' (phase start year)' });
+    }
+    return out;
+  },
+  // What will actually happen. folderHit = {Name} | null, targetExists = bool.
+  buildPlan: function(oldJob, newJob, changedFields, folderHit, targetExists){
+    var steps = [];
+    if (changedFields.length){
+      steps.push({ kind:'list', label:'Jobs_Master row: update ' + changedFields.join(', ') });
+    } else {
+      steps.push({ kind:'noop', label:'Jobs_Master row: no field changes' });
+    }
+    var newName = FVR_L.buildFolderName(newJob);
+    if (folderHit && folderHit.Name !== newName){
+      if (targetExists){
+        steps.push({ kind:'block', label:'Folder rename BLOCKED: "' + newName + '" already exists in 01_Job Name' });
+      } else {
+        steps.push({ kind:'folder', label:'Rename folder "' + folderHit.Name + '" → "' + newName +
+          '" (in place — contents, links and history preserved)' });
+      }
+    } else if (folderHit){
+      steps.push({ kind:'noop', label:'Folder "' + folderHit.Name + '" already matches — no rename' });
+    } else {
+      steps.push({ kind:'noop', label:'No job folder found for ' + oldJob.jobNumber + ' — nothing to rename (use ⚡ Job Kickoff to create one)' });
+    }
+    if (oldJob.jobNumber !== newJob.jobNumber || oldJob.clientName !== newJob.clientName){
+      steps.push({ kind:'manual', label:'Manual follow-up: rename the matching QuickBooks project ' +
+        '(QB → Sales → Customers → the project → Edit) — this tool does not write to QuickBooks' });
+    }
+    return steps;
+  },
+  mapJob: function(item){
+    function pick(cands){
+      for (var i = 0; i < cands.length; i++){
+        var v = item[cands[i]];
+        if (v !== undefined && v !== null && v !== '') return v;
+      }
+      return '';
+    }
+    return {
+      spId: item.Id || item.ID || null,
+      jobNumber:  pick(FVR_CFG.FIELDS.jobNumber),
+      clientName: pick(FVR_CFG.FIELDS.clientName),
+      jobName:    pick(FVR_CFG.FIELDS.jobName),
+      status:     pick(FVR_CFG.FIELDS.status)
+    };
+  },
+  // Which real column each logical field lives in, from the list's field roster.
+  resolveColumns: function(internalNames){
+    var have = {};
+    (internalNames || []).forEach(function(n){ have[n] = true; });
+    var out = {};
+    Object.keys(FVR_CFG.FIELDS).forEach(function(k){
+      out[k] = FVR_CFG.FIELDS[k].find(function(c){ return have[c]; }) || null;
+    });
+    return out;
+  },
+  diffFields: function(oldJob, newJob){
+    return ['jobNumber','clientName','jobName'].filter(function(k){
+      return String(oldJob[k] || '').trim() !== String(newJob[k] || '').trim();
+    });
+  }
+};
+
+/* ── SHAREPOINT REST HELPERS (same-origin; cookies do the auth) ───────────── */
+var FVR_digests = {};
+function fvrEsc(p){ return encodeURIComponent(String(p).replace(/'/g, "''")); }
+function fvrDigest(site){
+  var d = FVR_digests[site];
+  if (d && d.exp > Date.now()) return Promise.resolve(d.value);
+  return fetch(FVR_CFG.HOST + site + '/_api/contextinfo', {
+    method:'POST', headers:{ Accept:'application/json;odata=nometadata' }, credentials:'same-origin'
+  }).then(function(r){
+    if (!r.ok) throw new Error('contextinfo ' + r.status + ' on ' + site);
+    return r.json();
+  }).then(function(j){
+    var v = j.FormDigestValue || (j.d && j.d.GetContextWebInformation && j.d.GetContextWebInformation.FormDigestValue);
+    FVR_digests[site] = { value:v, exp: Date.now() + 20*60*1000 };
+    return v;
+  });
+}
+function fvrGet(site, apiPath, verbose){
+  return fetch(FVR_CFG.HOST + site + '/_api/' + apiPath, {
+    headers:{ Accept: verbose ? 'application/json;odata=verbose' : 'application/json;odata=nometadata' },
+    credentials:'same-origin'
+  });
+}
+function fvrPost(site, apiPath, opts){
+  opts = opts || {};
+  return fvrDigest(site).then(function(dig){
+    var headers = Object.assign({
+      Accept:'application/json;odata=verbose', 'X-RequestDigest':dig
+    }, opts.headers || {});
+    return fetch(FVR_CFG.HOST + site + '/_api/' + apiPath, {
+      method:'POST', headers:headers, credentials:'same-origin', body: opts.body
+    });
+  });
+}
+
+function fvrLoadJobsRaw(){
+  return fvrGet(FVR_CFG.OPS_SITE, "web/lists/getbytitle('" + FVR_CFG.JOBS_LIST + "')/items?$orderby=Id desc&$top=500")
+    .then(function(r){
+      if (!r.ok) throw new Error('Jobs_Master read failed (' + r.status + ')');
+      return r.json();
+    }).then(function(j){ return j.value || []; });
+}
+function fvrLoadColumns(){
+  return fvrGet(FVR_CFG.OPS_SITE, "web/lists/getbytitle('" + FVR_CFG.JOBS_LIST + "')/fields?$select=InternalName&$filter=Hidden eq false")
+    .then(function(r){
+      if (!r.ok) throw new Error('field roster read failed (' + r.status + ')');
+      return r.json();
+    }).then(function(j){
+      return FVR_L.resolveColumns((j.value || []).map(function(f){ return f.InternalName; }));
+    });
+}
+function fvrItemType(){
+  // Read the real ListItemEntityTypeFullName rather than deriving it.
+  return fvrGet(FVR_CFG.OPS_SITE, "web/lists/getbytitle('" + FVR_CFG.JOBS_LIST + "')?$select=ListItemEntityTypeFullName")
+    .then(function(r){
+      if (!r.ok) throw new Error('list metadata read failed (' + r.status + ')');
+      return r.json();
+    }).then(function(j){ return j.ListItemEntityTypeFullName; });
+}
+function fvrReadItem(id){
+  return fvrGet(FVR_CFG.OPS_SITE, "web/lists/getbytitle('" + FVR_CFG.JOBS_LIST + "')/items(" + id + ")")
+    .then(function(r){
+      if (!r.ok) throw new Error('item re-read failed (' + r.status + ')');
+      return r.json();
+    });
+}
+function fvrMergeItem(id, entityType, fields){
+  var body = Object.assign({ __metadata:{ type: entityType } }, fields);
+  return fvrPost(FVR_CFG.OPS_SITE, "web/lists/getbytitle('" + FVR_CFG.JOBS_LIST + "')/items(" + id + ")", {
+    headers:{
+      'Content-Type':'application/json;odata=verbose',
+      'IF-MATCH':'*', 'X-HTTP-Method':'MERGE'
+    },
+    body: JSON.stringify(body)
+  }).then(function(r){
+    if (r.ok || r.status === 204) return true;
+    return r.text().then(function(t){ throw new Error('row update ' + r.status + ': ' + t.slice(0,200)); });
+  });
+}
+function fvrListJobFolders(){
+  return fvrGet(FVR_CFG.JOBS_SITE, "web/GetFolderByServerRelativePath(DecodedUrl=@f)/Folders?@f='" +
+      fvrEsc(FVR_CFG.ACTIVE_ROOT) + "'&$select=Name,ServerRelativeUrl&$top=500&$orderby=Name")
+    .then(function(r){
+      if (!r.ok) return r.text().then(function(t){ throw new Error('list folders ' + r.status + ': ' + t.slice(0,200)); });
+      return r.json();
+    }).then(function(j){
+      var tmpl = FVR_CFG.TEMPLATE_FOLDER_NAME.toLowerCase();
+      return (j.value || []).filter(function(f){
+        return f.Name !== 'Forms' && f.Name.toLowerCase() !== tmpl;
+      });
+    });
+}
+function fvrFindFolder(folders, jobNumber){
+  var prefix = String(jobNumber || '').trim().toLowerCase();
+  if (!prefix) return null;
+  return folders.find(function(f){ return f.Name.toLowerCase().indexOf(prefix) === 0; }) || null;
+}
+// In-place folder rename via FileLeafRef — never a move, never a copy.
+function fvrRenameFolder(serverRelPath, newName){
+  return fvrPost(FVR_CFG.JOBS_SITE,
+    "web/GetFolderByServerRelativePath(DecodedUrl=@f)/ListItemAllFields/ValidateUpdateListItem?@f='" + fvrEsc(serverRelPath) + "'",
+    {
+      headers:{ 'Content-Type':'application/json;odata=verbose' },
+      body: JSON.stringify({ formValues:[{ FieldName:'FileLeafRef', FieldValue:newName }], bNewDocumentUpdate:false })
+    })
+    .then(function(r){
+      if (!r.ok) return r.text().then(function(t){ throw new Error('folder rename ' + r.status + ': ' + t.slice(0,200)); });
+      return r.json();
+    }).then(function(j){
+      var results = (j.d && j.d.ValidateUpdateListItem && j.d.ValidateUpdateListItem.results) ||
+                    (j.value) || [];
+      var bad = results.find(function(x){ return x.HasException; });
+      if (bad) throw new Error('folder rename rejected: ' + (bad.ErrorMessage || 'unknown SP error'));
+      return true;
+    });
+}
+function fvrLogRun(entry){
+  var body = JSON.stringify({
+    __metadata:{ type:'SP.Data.Automation_x005f_LogListItem' },
+    Title: 'Job Rename',
+    Job_Number: entry.jobNumber || '',
+    Result: entry.result || '',
+    Details: JSON.stringify(entry.details || {}).slice(0, 60000)
+  });
+  return fvrPost(FVR_CFG.OPS_SITE, "web/lists/getbytitle('" + FVR_CFG.LOG_LIST + "')/items", {
+    headers:{ 'Content-Type':'application/json;odata=verbose' }, body: body
+  }).catch(function(){ /* audit list may not exist — never block the rename */ });
+}
+
+/* ── UI ───────────────────────────────────────────────────────────────────── */
+var FVR_state = { raw:[], jobs:[], job:null, columns:null, entityType:null, folders:[], busy:false };
+
+function fvrEl(id){ return document.getElementById(id); }
+function fvrEscHtml(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
+  return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;' }[c]; }); }
+
+function fvrOpen(prefill){
+  fvrEl('fvr-overlay').style.display = 'block';
+  fvrEl('fvr-modal').style.display = 'block';
+  fvrRenderPicker(prefill || null);
+}
+function fvrClose(){
+  fvrEl('fvr-overlay').style.display = 'none';
+  fvrEl('fvr-modal').style.display = 'none';
+  FVR_state.job = null; FVR_state.busy = false;
+}
+
+function fvrRenderPicker(prefill){
+  var b = fvrEl('fvr-body');
+  b.innerHTML =
+    '<div class="fvr-row"><label>Job to edit</label>' +
+    '<input type="text" id="fvr-search" placeholder="Search by job number, client, or job name…" autocomplete="off">' +
+    '<div class="fvr-joblist" id="fvr-joblist"><div style="color:#5a6b7e;padding:10px">Loading jobs…</div></div>' +
+    '<div class="fvr-hint">All Jobs_Master rows are listed (any status) — closed jobs can be fixed too.</div></div>';
+  fvrLoadJobsRaw().then(function(raw){
+    FVR_state.raw = raw;
+    FVR_state.jobs = raw.map(FVR_L.mapJob).filter(function(j){ return j.jobNumber; });
+    if (prefill && prefill.jobNumber){
+      var hit = FVR_state.jobs.find(function(j){ return j.jobNumber === prefill.jobNumber; });
+      if (hit){ fvrRenderForm(hit); return; }
+    }
+    fvrDrawJobList(FVR_state.jobs);
+    fvrEl('fvr-search').oninput = function(){
+      var q = this.value.toLowerCase();
+      fvrDrawJobList(FVR_state.jobs.filter(function(j){
+        return (j.jobNumber + ' ' + j.clientName + ' ' + j.jobName).toLowerCase().indexOf(q) !== -1;
+      }));
+    };
+  }).catch(function(err){
+    fvrEl('fvr-joblist').innerHTML = '<div class="fvr-err" style="padding:10px">' + fvrEscHtml(err.message) + '</div>';
+  });
+}
+function fvrDrawJobList(jobs){
+  var el = fvrEl('fvr-joblist');
+  if (!el) return;
+  el.innerHTML = jobs.length ? '' : '<div style="color:#5a6b7e">No matching jobs</div>';
+  jobs.slice(0, 40).forEach(function(j){
+    var d = document.createElement('div');
+    d.textContent = j.jobNumber + ' — ' + (j.clientName || '(no client)') +
+      (j.jobName ? ' — ' + j.jobName : '') + (j.status ? '  [' + j.status + ']' : '');
+    d.onclick = function(){ fvrRenderForm(j); };
+    el.appendChild(d);
+  });
+}
+
+function fvrNumberHint(numStr){
+  var p = FVR_L.parseJobNumber(numStr);
+  if (!p) return 'Format: YY-PP-NNNNN — e.g. 26-02-00043';
+  return 'Year 20' + p.yy + ' · ' + FVR_L.phaseLabel(p.pp) + ' · Job #' + p.seq +
+    ' — the last 5 stay with the job for life; a phase change only flips the middle code (and maybe the year).';
+}
+
+function fvrRenderForm(job){
+  FVR_state.job = job;
+  var b = fvrEl('fvr-body');
+  b.innerHTML =
+    '<div class="fvr-row"><label>Job number</label><input type="text" id="fvr-num" value="' + fvrEscHtml(job.jobNumber) + '">' +
+      '<div class="fvr-hint" id="fvr-num-hint"></div></div>' +
+    '<div class="fvr-row"><label>Client name</label><input type="text" id="fvr-client" value="' + fvrEscHtml(job.clientName) + '"></div>' +
+    '<div class="fvr-row"><label>Job name</label><input type="text" id="fvr-jobname" value="' + fvrEscHtml(job.jobName) + '">' +
+      '<div class="fvr-hint">Free text, e.g. "Sherman Water Loss" — shown in the app, not part of the folder name.</div></div>' +
+    '<div class="fvr-row"><label>Checks &amp; plan</label><div class="fvr-plan" id="fvr-plan">Type to see the plan…</div></div>' +
+    '<div class="fvr-actions">' +
+      '<button class="fvr-btn ghost" id="fvr-back">← Back</button>' +
+      '<button class="fvr-btn primary" id="fvr-go" disabled>Apply changes</button>' +
+      '<label class="fvr-drh"><input type="checkbox" id="fvr-dry"> Dry run (show plan only)</label>' +
+    '</div>' +
+    '<div class="fvr-status" id="fvr-status"></div>';
+
+  fvrEl('fvr-back').onclick = function(){ fvrRenderPicker(null); };
+  fvrEl('fvr-num').oninput = fvrRefreshPlan;
+  fvrEl('fvr-client').oninput = fvrRefreshPlan;
+  fvrEl('fvr-jobname').oninput = fvrRefreshPlan;
+  fvrEl('fvr-go').onclick = fvrExecute;
+  fvrRefreshPlan();
+}
+
+function fvrReadForm(){
+  var old = FVR_state.job;
+  return {
+    spId: old.spId,
+    jobNumber:  fvrEl('fvr-num').value.trim(),
+    clientName: fvrEl('fvr-client').value.trim(),
+    jobName:    fvrEl('fvr-jobname').value.trim(),
+    // jobType only affects the folder suffix; keep whatever the current folder implies
+    jobType: old.jobType || ''
+  };
+}
+
+function fvrRefreshPlan(){
+  var old = FVR_state.job;
+  var next = fvrReadForm();
+  fvrEl('fvr-num-hint').textContent = fvrNumberHint(next.jobNumber);
+  var checks = FVR_L.validateChange(old, next, FVR_state.jobs);
+  var changed = FVR_L.diffFields(old, next);
+  var blocked = checks.some(function(c){ return c.level === 'block'; });
+
+  // folder situation is looked up lazily but cheaply cached
+  var render = function(folderHit, targetExists){
+    var steps = FVR_L.buildPlan(old, next, changed, folderHit, targetExists);
+    blocked = blocked || steps.some(function(s){ return s.kind === 'block'; });
+    var html = '<ul style="margin:0;padding-left:18px">';
+    checks.forEach(function(c){
+      var cls = c.level === 'block' ? 'fvr-err' : (c.level === 'warn' ? 'fvr-warn' : 'fvr-ok');
+      html += '<li class="' + cls + '">' + fvrEscHtml(c.msg) + '</li>';
+    });
+    steps.forEach(function(s){
+      var cls = s.kind === 'block' ? 'fvr-err' : (s.kind === 'manual' ? 'fvr-warn' : (s.kind === 'noop' ? '' : 'fvr-ok'));
+      html += '<li class="' + cls + '">' + fvrEscHtml(s.label) + '</li>';
+    });
+    html += '</ul>';
+    fvrEl('fvr-plan').innerHTML = html;
+    fvrEl('fvr-go').disabled = blocked || !changed.length || FVR_state.busy;
+  };
+
+  if (FVR_state.folders.length){
+    var hit = fvrFindFolder(FVR_state.folders, old.jobNumber);
+    var newName = FVR_L.buildFolderName(next);
+    var exists = FVR_state.folders.some(function(f){ return f.Name === newName && (!hit || f.Name !== hit.Name); });
+    render(hit, exists);
+  } else {
+    fvrListJobFolders().then(function(folders){
+      FVR_state.folders = folders;
+      fvrRefreshPlan();
+    }).catch(function(){ render(null, false); });
+  }
+}
+
+function fvrExecute(){
+  if (FVR_state.busy) return;
+  var old = FVR_state.job;
+  var next = fvrReadForm();
+  var dry = fvrEl('fvr-dry').checked;
+  var changed = FVR_L.diffFields(old, next);
+  var status = fvrEl('fvr-status');
+  if (dry){ status.innerHTML = '<span class="fvr-ok">Dry run — nothing was written. The plan above is exactly what Apply would do.</span>'; return; }
+
+  FVR_state.busy = true;
+  fvrEl('fvr-go').disabled = true;
+  status.textContent = 'Applying…';
+
+  var done = [];
+  Promise.all([fvrLoadColumns(), fvrItemType(), fvrReadItem(old.spId)])
+    .then(function(res){
+      var cols = res[0], entityType = res[1], fresh = FVR_L.mapJob(res[2]);
+      // Two-device race guard: the row must still be what the form was opened from.
+      if (fresh.jobNumber !== old.jobNumber || fresh.clientName !== old.clientName || fresh.jobName !== old.jobName){
+        throw new Error('This job changed on another device since you opened it — reopening with fresh data.');
+      }
+      var fields = {};
+      changed.forEach(function(k){
+        if (cols[k]) fields[cols[k]] = next[k];
+      });
+      if (!Object.keys(fields).length) throw new Error('No writable columns resolved for: ' + changed.join(', '));
+      return fvrMergeItem(old.spId, entityType, fields).then(function(){
+        done.push('Jobs_Master row updated (' + changed.join(', ') + ')');
+      });
+    })
+    .then(function(){
+      var hit = fvrFindFolder(FVR_state.folders, old.jobNumber);
+      if (!hit) { done.push('No folder to rename'); return; }
+      var newName = FVR_L.buildFolderName(next);
+      if (hit.Name === newName) { done.push('Folder already matches'); return; }
+      return fvrRenameFolder(hit.ServerRelativeUrl, newName).then(function(){
+        done.push('Folder renamed → "' + newName + '"');
+      });
+    })
+    .then(function(){
+      status.innerHTML = '<span class="fvr-ok">✓ ' + done.map(fvrEscHtml).join(' · ') +
+        '</span><div class="fvr-hint">Remember the QuickBooks project rename if this job is in QB (manual, in QB itself).</div>';
+      fvrLogRun({ jobNumber: next.jobNumber, result: 'success',
+        details: { itemId: old.spId, from: { num: old.jobNumber, client: old.clientName, name: old.jobName },
+                   to: { num: next.jobNumber, client: next.clientName, name: next.jobName }, steps: done } });
+      FVR_state.folders = []; // force re-list next time
+      FVR_state.jobs = [];
+      FVR_state.busy = false;
+      var updated = Object.assign({}, next);
+      FVR_state.job = updated;
+    })
+    .catch(function(err){
+      FVR_state.busy = false;
+      fvrEl('fvr-go').disabled = false;
+      status.innerHTML = '<span class="fvr-err">✗ ' + fvrEscHtml(err.message) + '</span>' +
+        (done.length ? '<div class="fvr-hint">Completed before the error: ' + fvrEscHtml(done.join(' · ')) + '</div>' : '');
+      fvrLogRun({ jobNumber: next.jobNumber, result: 'error: ' + err.message,
+        details: { itemId: old.spId, completed: done } });
+      if (/changed on another device/.test(err.message)) fvrRenderPicker(null);
+    });
+}
+
+/* ── WIRING ───────────────────────────────────────────────────────────────── */
+function fvrInit(){
+  var fab = fvrEl('fvr-fab');
+  if (!fab) return; // not in a browser (test sandbox)
+  fab.onclick = function(){ fvrOpen(null); };
+  fvrEl('fvr-close').onclick = fvrClose;
+  fvrEl('fvr-overlay').onclick = fvrClose;
+}
+if (typeof document !== 'undefined'){
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fvrInit);
+  else fvrInit();
+}
+
+window.FVJobRename = { open: fvrOpen, _logic: FVR_L, _cfg: FVR_CFG };
+})();
+</script>

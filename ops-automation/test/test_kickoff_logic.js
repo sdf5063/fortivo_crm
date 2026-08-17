@@ -17,7 +17,7 @@ assert.strictEqual(L.sanitizeName('  Steinhardt Vehicle.  '), 'Steinhardt Vehicl
 assert.strictEqual(L.sanitizeName('A#B%C|D\\E'), 'A B C D E');
 console.log('✓ sanitizeName strips SP-illegal characters');
 
-// ── buildFolderName (matches observed convention: 26-02-00051 (Sherman-Recon)) ──
+// ── buildFolderName (matches real observed folder: 26-02-00043 (Peters-Repair)) ──
 assert.strictEqual(
   L.buildFolderName({ jobNumber: '26-01-00055', clientName: 'Alec Sherman', jobType: 'Mitigation' }),
   '26-01-00055 (Alec Sherman-Mit)');
@@ -39,8 +39,11 @@ console.log('✓ buildFolderName follows the naming convention with clean edge c
 
 // ── inferTypeFromNumber (YY-PP-NNNNN) ──
 assert.strictEqual(L.inferTypeFromNumber('26-01-00055'), 'Mitigation');
-assert.strictEqual(L.inferTypeFromNumber('26-02-00051'), 'Repair');
-assert.strictEqual(L.inferTypeFromNumber('25-06-00126'), '');
+// phase sibling of the same job: same last-5, PP flips (numbering convention)
+assert.strictEqual(L.inferTypeFromNumber('26-02-00055'), 'Repair');
+// 05 and 99 are live but unmapped until Scott confirms their meanings
+assert.strictEqual(L.inferTypeFromNumber('26-05-00039'), '');
+assert.strictEqual(L.inferTypeFromNumber('26-99-00017'), '');
 assert.strictEqual(L.inferTypeFromNumber('garbage'), '');
 console.log('✓ inferTypeFromNumber maps the PP segment');
 

@@ -103,10 +103,18 @@ var FVK_CFG = {
   CONTRACT_SUBFOLDER: '01_Contract',
   JOBS_LIST: 'Jobs_Master',
   LOG_LIST: 'Automation_Log',                       // best-effort audit log (see INTEGRATION.md)
-  NAME_PATTERN: '{num} ({client}-{type})',          // observed convention: 26-02-00051 (Sherman-Recon)
+  NAME_PATTERN: '{num} ({client}-{type})',          // real observed folder: 26-02-00043 (Peters-Repair)
   JOB_TYPES: ['Mitigation','Repair','Reconstruction','Contents','Other'],
   TYPE_SHORT: { Mitigation:'Mit', Repair:'Repair', Reconstruction:'Recon', Contents:'Contents', Other:'' },
-  // job number = YY-PP-NNNNN; PP segment hints the type (verify/extend as you add codes)
+  // Fortivo numbering convention: YY-PP-NNNNN.
+  //   NNNNN = the job's PERMANENT identity — a phase change (mitigation →
+  //           rebuild) KEEPS the last 5 and only flips PP (and possibly YY to
+  //           the new phase's start year). Confirmed in live QBO data:
+  //           25-01-00129→25-02-00129, 25-01-00139→25-02-00139,
+  //           26-01-00029→26-02-00029, 26-01-00043→26-02-00043.
+  //   PP = classification code. 01/02 confirmed; 05 and 99 are in live use
+  //        (26-05-00039, 26-99-000xx) — meanings pending Scott, so they are
+  //        deliberately NOT mapped here (jobType then comes from the form).
   TYPE_SEGMENT_MAP: { '01':'Mitigation', '02':'Repair' },
   ACTIVE_STATUSES: ['Open','In Progress','On Hold'],
   // Candidate column names, first match wins — resilient to naming drift in Jobs_Master
