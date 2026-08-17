@@ -100,9 +100,9 @@ var FVR_CFG = {
   //   NNNNN = permanent job identity, kept across phases.
   //   PP    = classification code; flips on phase change (mit → rebuild).
   //   YY    = start year of the CURRENT phase (may advance with a new phase).
-  // Codes confirmed from live QBO data: 01, 02. Codes 05 and 99 are in live
-  // use (26-05-00039, 26-99-00017/27/30) — labels pending Scott's confirmation.
-  PHASE_LABELS: { '01':'Mitigation', '02':'Repair/Reconstruction', '05':'05 (unconfirmed)', '99':'99 (unconfirmed)' },
+  // Labels below are the authoritative TYPE_MAP from fortivo_app.html.
+  PHASE_LABELS: { '01':'Mitigation', '02':'Restoration / Rebuild', '03':'Abatement',
+                  '04':'Demolition', '05':'Consulting / Estimating', '06':'Bid', '99':'Miscellaneous' },
   FIELDS: {
     jobNumber:  ['Job_Number','JobNumber','Title'],
     clientName: ['Client_Name','Client','Account_Name'],
@@ -205,6 +205,14 @@ var FVR_L = {
       steps.push({ kind:'noop', label:'Folder "' + folderHit.Name + '" already matches — no rename' });
     } else {
       steps.push({ kind:'noop', label:'No job folder found for ' + oldJob.jobNumber + ' — nothing to rename (use ⚡ Job Kickoff to create one)' });
+    }
+    if (oldJob.jobNumber !== newJob.jobNumber){
+      // The job number is the Job Manager's primary key: DFRs, equipment
+      // assignments, sign-in sheets, and file updates all reference it.
+      // This tool does not re-key those records (yet) — say so plainly.
+      steps.push({ kind:'manual', label:'Heads-up: records already linked to ' + oldJob.jobNumber +
+        ' (DFRs, equipment assignments, sign-in sheets, file updates) keep the OLD number — ' +
+        'this tool does not re-key them. Fine for brand-new jobs; for older jobs ask Claude for the re-key pass.' });
     }
     if (oldJob.jobNumber !== newJob.jobNumber || oldJob.clientName !== newJob.clientName){
       steps.push({ kind:'manual', label:'Manual follow-up: rename the matching QuickBooks project ' +

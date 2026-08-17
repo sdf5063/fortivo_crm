@@ -98,7 +98,8 @@ let plan = L.buildPlan(
 assert(plan.some(s => s.kind === 'list'));
 assert(plan.some(s => s.kind === 'folder' && /26-01-00052 \(Anna Ansaldo-Mit\)/.test(s.label)));
 assert(plan.some(s => s.kind === 'manual' && /QuickBooks/.test(s.label)));
-console.log('✓ plan: row update + folder rename + QB manual reminder');
+assert(plan.some(s => s.kind === 'manual' && /keep the OLD number/.test(s.label)));
+console.log('✓ plan: row update + folder rename + linked-record heads-up + QB reminder');
 
 plan = L.buildPlan(jobs[0], { jobNumber:'26-01-00052', clientName:'Anna Ansaldo', jobType:'' },
   ['jobNumber'], { Name:'x' }, true);
