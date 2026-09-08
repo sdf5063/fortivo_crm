@@ -139,3 +139,20 @@ twins = L.clientTwinFolders(folders, '26-01-00058', 'Kodiak Properties');
 assert.strictEqual(twins.length, 0, 'matching folder for own number is fine');
 assert.strictEqual(L.clientTwinFolders(folders, 'garbage', 'Brad Weinstein').length, 0);
 console.log('✓ clientTwinFolders flags stale-numbered duplicates for the same client+phase');
+
+// ── duplicate Jobs_Master rows (the way a stale number reaches the picker) ──
+const rows = [
+  { spId: 1, jobNumber: '26-01-00057', clientName: 'Brad Weinstein' },   // stale
+  { spId: 2, jobNumber: '26-01-00059', clientName: 'Brad Weinstein' },   // Dashboard truth
+  { spId: 3, jobNumber: '26-02-00059', clientName: 'Brad Weinstein' },   // repair phase — own group
+  { spId: 4, jobNumber: '26-01-00058', clientName: 'Kodiak Properties' },
+  { spId: 5, jobNumber: 'garbage',      clientName: 'X' }
+];
+const flags = L.duplicateRowFlags(rows);
+assert.deepStrictEqual(Object.keys(flags).sort().join(','), '1,2');
+assert.strictEqual(flags[1].join(','), '26-01-00059');
+assert.strictEqual(flags[2].join(','), '26-01-00057');
+assert.strictEqual(flags[3], undefined, 'repair phase alone is not a duplicate');
+assert.strictEqual(flags[4], undefined);
+assert.strictEqual(Object.keys(L.duplicateRowFlags([])).length, 0);
+console.log('✓ duplicateRowFlags marks same client+phase rows with different numbers');

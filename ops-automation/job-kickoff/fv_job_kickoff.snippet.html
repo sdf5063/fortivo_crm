@@ -172,6 +172,31 @@ var FVK_L = {
       ' but the Job Manager on this device shows ' + local.id +
       '. Fix the job number first, then re-run — a folder must never be created from a stale number.';
   },
+  // Rows that share client + phase but carry DIFFERENT numbers — a duplicate
+  // Jobs_Master row is how a stale number reaches the picker in the first
+  // place. Returns {spId: [other numbers…]} for every row in such a group.
+  duplicateRowFlags: function(jobs){
+    var groups = {};
+    (jobs || []).forEach(function(j){
+      var p = FVK_L.parseNum(j.jobNumber);
+      var client = String(j.clientName || '').trim().toLowerCase();
+      if (!p || !client || !j.spId) return;
+      var k = client + '|' + p.pp;
+      (groups[k] = groups[k] || []).push(j);
+    });
+    var flags = {};
+    Object.keys(groups).forEach(function(k){
+      var g = groups[k], seqs = {};
+      g.forEach(function(j){ seqs[FVK_L.parseNum(j.jobNumber).seq] = true; });
+      if (Object.keys(seqs).length > 1){
+        g.forEach(function(j){
+          flags[j.spId] = g.filter(function(o){ return o.jobNumber !== j.jobNumber; })
+                           .map(function(o){ return o.jobNumber; });
+        });
+      }
+    });
+    return flags;
+  },
   // WARN: an existing folder looks like the same client + same phase under a
   // DIFFERENT number (the "stale twin" pattern of the Weinstein incident).
   clientTwinFolders: function(folderNames, jobNumber, clientName){
@@ -412,6 +437,7 @@ function fvkRenderPicker(prefill){
   if (prefill && prefill.jobNumber){ fvkRenderForm(prefill); return; }
   fvkLoadJobs().then(function(jobs){
     FVK_state.jobs = jobs;
+    FVK_state.dupFlags = FVK_L.duplicateRowFlags(jobs);
     fvkDrawJobList(jobs);
     fvkEl('fvk-search').oninput = function(){
       var q = this.value.toLowerCase();
@@ -431,6 +457,13 @@ function fvkDrawJobList(jobs){
   jobs.slice(0, 40).forEach(function(j){
     var d = document.createElement('div');
     d.textContent = j.jobNumber + ' — ' + (j.clientName || '(no client)') + (j.status ? '  [' + j.status + ']' : '');
+    var dups = (FVK_state.dupFlags || {})[j.spId];
+    if (dups && dups.length){
+      var w = document.createElement('span');
+      w.style.color = '#8a6100'; w.style.fontWeight = '600';
+      w.textContent = ' ⚠ also listed as ' + dups.join(', ');
+      d.appendChild(w);
+    }
     d.onclick = function(){ fvkRenderForm(j); };
     el.appendChild(d);
   });
@@ -529,6 +562,12 @@ function fvkAnalyze(){
     if (!FVK_L.parseNum(j2.jobNumber)){
       html += '<div class="fvk-warn">&#9888; Job number "' + fvkEscHtml(j2.jobNumber) +
         '" is not YY-PP-NNNNN — double-check before creating.</div>';
+    }
+    var dupRows = (FVK_state.dupFlags || {})[j2.spId];
+    if (dupRows && dupRows.length){
+      html += '<div class="fvk-warn">&#9888; Jobs_Master has ANOTHER row for this client + phase numbered <b>' +
+        dupRows.map(fvkEscHtml).join('</b>, <b>') +
+        '</b> — one of them is stale. Use the number the Dashboard shows, and fix or delete the stale row before creating folders.</div>';
     }
     var twins = FVK_L.clientTwinFolders(FVK_state.allJobFolders, j2.jobNumber, j2.clientName);
     if (twins.length){
