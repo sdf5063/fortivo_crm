@@ -103,3 +103,39 @@ assert.strictEqual(CFG.CONTRACT_SUBFOLDER, '01_Contract');
 console.log('✓ config paths match the live SharePoint structure');
 
 console.log('\nAll Job Kickoff logic tests passed.');
+
+// ── GUARD V2: stale-number protection (Weinstein incident, 2026-09-08) ──
+assert.strictEqual(L.parseNum('26-01-00059').seq, 59);
+assert.strictEqual(L.parseNum('26-01-000531'), null, '6-digit malformed number rejected');
+assert.strictEqual(L.parseNum('26-01-00059 (Brad Weinstein-Mit)'), null, 'suffixed string rejected by strict parse');
+
+const localJobs = [
+  { id: '26-01-00061', _spId: 88, client: 'Brad Weinstein' },
+  { id: '26-02-00061', _spId: 89, client: 'Brad Weinstein' }
+];
+assert.strictEqual(L.localAppJob(88, localJobs).id, '26-01-00061');
+assert.strictEqual(L.localAppJob(77, localJobs), null);
+assert.strictEqual(L.localAppJob(null, localJobs), null);
+// SP row says 00059 while the app on this device says 00061 → hard block
+const mm = L.numberMismatch({ spId: 88, jobNumber: '26-01-00059' }, L.localAppJob(88, localJobs));
+assert(/26-01-00059/.test(mm) && /26-01-00061/.test(mm) && /stale/.test(mm));
+assert.strictEqual(L.numberMismatch({ spId: 88, jobNumber: '26-01-00061' }, localJobs[0]), null);
+assert.strictEqual(L.numberMismatch({ spId: 1, jobNumber: '26-01-00059' }, null), null, 'no local copy → no verdict');
+console.log('✓ numberMismatch blocks SP-vs-app number drift');
+
+// Existing folders from the real incident: same client + phase, older number
+const folders = [
+  '26-01-00057 (Brad Weinstein-Mit)',
+  '26-01-00058 (Kodiak Properties-Mit)',
+  '26-02-00059 (Brad Weinstein-Repair)',
+  '01_Template Job Folder'
+];
+let twins = L.clientTwinFolders(folders, '26-01-00059', 'Brad Weinstein');
+assert.strictEqual(twins.length, 1);
+assert.strictEqual(twins[0], '26-01-00057 (Brad Weinstein-Mit)'); // same phase 01, different seq
+twins = L.clientTwinFolders(folders, '26-02-00059', 'Brad Weinstein');
+assert.strictEqual(twins.length, 0, 'own folder (same seq) is not a twin');
+twins = L.clientTwinFolders(folders, '26-01-00058', 'Kodiak Properties');
+assert.strictEqual(twins.length, 0, 'matching folder for own number is fine');
+assert.strictEqual(L.clientTwinFolders(folders, 'garbage', 'Brad Weinstein').length, 0);
+console.log('✓ clientTwinFolders flags stale-numbered duplicates for the same client+phase');

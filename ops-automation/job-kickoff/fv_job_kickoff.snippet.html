@@ -141,7 +141,50 @@ var FVK_CFG = {
 };
 
 /* ── PURE LOGIC (exposed as FVKickoff._logic for the node test suite) ─────── */
+/* FVK GUARD V2 (2026-09-08): stale-number protection. Folders were minted
+   from Jobs_Master rows whose numbers lagged the Job Manager's own data
+   (Brad Weinstein: folder 26-01-00057 on Sep 4, 00059 pair on Sep 7, while
+   the app showed a newer number). Before creating anything the kickoff now
+   cross-checks the picked SP row against this device's app data
+   (localStorage 'fv_jobs') and against the existing folder landscape. */
 var FVK_L = {
+  // Strict Fortivo number parse — guards refuse to reason about anything else
+  parseNum: function(s){
+    var m = /^(\d{2})-(\d{2})-(\d{5})$/.exec(String(s || '').trim());
+    return m ? { yy:m[1], pp:m[2], seq:parseInt(m[3], 10) } : null;
+  },
+  // The Job Manager stores its jobs in localStorage 'fv_jobs' (KEYS.jobs in
+  // fortivo_app.html — keep the literal in sync). Same page, same storage.
+  localAppJob: function(spId, jobsOpt){
+    if (!spId) return null;
+    var jobs = jobsOpt;
+    if (!jobs){
+      try { jobs = JSON.parse(localStorage.getItem('fv_jobs')) || []; }
+      catch(e){ return null; }
+    }
+    return jobs.find(function(x){ return x && x._spId === spId; }) || null;
+  },
+  // BLOCK: the SP row and this device's app copy of the SAME row disagree.
+  numberMismatch: function(row, local){
+    if (!row || !local || !local.id || !row.jobNumber) return null;
+    if (String(local.id).trim() === String(row.jobNumber).trim()) return null;
+    return 'NUMBER OUT OF SYNC: SharePoint says ' + row.jobNumber +
+      ' but the Job Manager on this device shows ' + local.id +
+      '. Fix the job number first, then re-run — a folder must never be created from a stale number.';
+  },
+  // WARN: an existing folder looks like the same client + same phase under a
+  // DIFFERENT number (the "stale twin" pattern of the Weinstein incident).
+  clientTwinFolders: function(folderNames, jobNumber, clientName){
+    var p = FVK_L.parseNum(jobNumber);
+    var client = String(clientName || '').trim().toLowerCase();
+    if (!p || !client) return [];
+    return (folderNames || []).filter(function(n){
+      var s = String(n);
+      if (s.toLowerCase().indexOf('(' + client) === -1) return false;
+      var fp = FVK_L.parseNum(s.split(' ')[0]);
+      return !!(fp && fp.pp === p.pp && fp.seq !== p.seq);
+    });
+  },
   // SharePoint-illegal / risky filename characters removed, whitespace collapsed
   sanitizeName: function(s){
     return String(s || '')
@@ -459,10 +502,12 @@ function fvkAnalyze(){
   var planEl = fvkEl('fvk-plan');
   Promise.all([
     fvkListSubfolders(FVK_CFG.JOBS_SITE, FVK_CFG.TEMPLATE_FOLDER),
-    fvkFindExistingJobFolder(j.jobNumber)
+    fvkFindExistingJobFolder(j.jobNumber),
+    fvkListSubfolders(FVK_CFG.JOBS_SITE, FVK_CFG.ACTIVE_ROOT).catch(function(){ return []; })
   ]).then(function(res){
     FVK_state.templateFolders = res[0].map(function(f){ return f.Name; });
     FVK_state.existing = res[1];
+    FVK_state.allJobFolders = (res[2] || []).map(function(f){ return f.Name; });
     // Repair mode previews the actual DIFF (what exists vs what's missing),
     // not the raw template manifest — execution always diffed; now the
     // preview matches what execution will really do.
@@ -474,6 +519,23 @@ function fvkAnalyze(){
   }).then(function(existingNames){
     var j2 = fvkReadForm();
     var html = '';
+    // ── GUARD V2: stale-number protection (blocks/warns BEFORE any write) ──
+    var mismatch = FVK_L.numberMismatch(j2, FVK_L.localAppJob(j2.spId));
+    if (mismatch){
+      planEl.innerHTML = '<div class="fvk-err"><b>&#9940; ' + fvkEscHtml(mismatch) + '</b></div>';
+      var goB = fvkEl('fvk-go'); goB.disabled = true; goB.textContent = 'Blocked — number out of sync';
+      return;
+    }
+    if (!FVK_L.parseNum(j2.jobNumber)){
+      html += '<div class="fvk-warn">&#9888; Job number "' + fvkEscHtml(j2.jobNumber) +
+        '" is not YY-PP-NNNNN — double-check before creating.</div>';
+    }
+    var twins = FVK_L.clientTwinFolders(FVK_state.allJobFolders, j2.jobNumber, j2.clientName);
+    if (twins.length){
+      html += '<div class="fvk-warn">&#9888; Same client + phase already has folder(s) under a DIFFERENT number: <b>' +
+        twins.map(fvkEscHtml).join('</b>, <b>') +
+        '</b>. If that is this same job under a stale number, STOP and fix the number instead of creating a duplicate folder.</div>';
+    }
     if (FVK_state.existing){
       var missing = FVK_L.planMissing(FVK_state.templateFolders, existingNames || []);
       html += '<div><span class="fvk-badge repair">FOLDER EXISTS</span> <b>' + fvkEscHtml(FVK_state.existing.Name) +
@@ -534,7 +596,31 @@ function fvkExecute(){
      just each create the gaps the other hasn't yet — no duplicates,
      no overwrites, no renames. ── */
   var s0 = fvkStep('<span class="fvk-spin"></span> Re-checking current folder state…');
-  fvkFindExistingJobFolder(j.jobNumber).then(function(fresh){
+  // GUARD V2: final stale-number check at the moment of execution — the SP
+  // row is re-read fresh so a renumber since the plan was shown is caught.
+  var rowCheck = j.spId
+    ? fvkGet(FVK_CFG.OPS_SITE, "web/lists/getbytitle('" + FVK_CFG.JOBS_LIST + "')/items(" + j.spId + ')')
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .then(function(item){
+          if (!item) return;
+          var freshNum = FVK_L.mapJob(item).jobNumber;
+          if (freshNum && freshNum !== j.jobNumber){
+            fvkSetStep(s0, '<span class="fvk-err">&#9940; This job was renumbered to ' + fvkEscHtml(freshNum) +
+              ' since the plan was shown. Plan refreshed — review and run again.</span>');
+            FVK_state.busy = false;
+            fvkRenderForm(FVK_L.mapJob(item));
+            throw { fvkAbort: true };
+          }
+          var mm = FVK_L.numberMismatch({ spId: j.spId, jobNumber: freshNum }, FVK_L.localAppJob(j.spId));
+          if (mm){
+            fvkSetStep(s0, '<span class="fvk-err">&#9940; ' + fvkEscHtml(mm) + '</span>');
+            FVK_state.busy = false;
+            fvkEl('fvk-go').disabled = false;
+            throw { fvkAbort: true };
+          }
+        })
+    : Promise.resolve();
+  rowCheck.then(function(){ return fvkFindExistingJobFolder(j.jobNumber); }).then(function(fresh){
     var before = FVK_state.existing ? FVK_state.existing.ServerRelativeUrl : null;
     var now = fresh ? fresh.ServerRelativeUrl : null;
     if (before !== now){
