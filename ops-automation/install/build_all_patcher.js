@@ -202,8 +202,16 @@ if (!br.ok){
   console.log('backup verified: _backups/' + backupName);
 }
 
-/* upload patched master */
-const outBuf = new TextEncoder().encode(text);
+/* upload patched master (preserve a leading BOM if the original had one —
+   TextDecoder strips it on decode and TextEncoder never re-adds it) */
+const hadBom = origBuf.byteLength >= 3 && new Uint8Array(origBuf, 0, 3).join(',') === '239,187,191';
+const bodyBytes = new TextEncoder().encode(text);
+let outBuf = bodyBytes;
+if (hadBom){
+  outBuf = new Uint8Array(bodyBytes.length + 3);
+  outBuf.set([239, 187, 191], 0);
+  outBuf.set(bodyBytes, 3);
+}
 const ur = await sp("/_api/web/GetFolderByServerRelativePath(DecodedUrl=@f)/Files/AddUsingPath(DecodedUrl=@n,overwrite=@o)?@f='" +
   enc(SITE + '/SiteAssets') + "'&@n='fortivo_app.html'&@o=true", outBuf, 'application/octet-stream');
 if (!ur.ok) throw new Error('master upload failed: ' + ur.status + ' ' + (await ur.text()).slice(0,200) + ' - restore from _backups/' + backupName + ' if needed.');
